@@ -3,9 +3,10 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import plotly.graph_objects as go
+from streamlit_gsheets import GSheetsConnection
 
 # --- 1. KONFIGURATION & VERSION ---
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.4.0"
 st.set_page_config(page_title=f"Risk Sim v{APP_VERSION}", layout="wide")
 
 # --- 2. LOGIN VIA SECRETS ---
@@ -21,22 +22,20 @@ if not st.session_state["auth_ok"]:
         
         if submit:
             try:
-                # Prüfung gegen .streamlit/secrets.toml
-                correct_user = st.secrets["credentials"]["username"]
-                correct_pw = st.secrets["credentials"]["password"]
-                
-                if user_input == correct_user and pw_input == correct_pw:
+                if user_input == st.secrets["credentials"]["username"] and \
+                   pw_input == st.secrets["credentials"]["password"]:
                     st.session_state["auth_ok"] = True
                     st.rerun()
                 else:
-                    st.error("Falsche Daten.")
+                    st.error("Falsche Login-Daten.")
             except Exception:
-                st.error("Konfigurationsfehler: .streamlit/secrets.toml nicht gefunden oder falsch formatiert.")
+                st.error("Konfigurationsfehler: Secrets nicht gefunden.")
     st.stop()
 
-# --- 3. HAUPTLOGIK (Wird nur erreicht, wenn auth_ok == True) ---
+# --- 3. VERBINDUNGEN & FUNKTIONEN ---
+# Google Sheets Verbindung initialisieren
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- INTERNE FUNKTIONEN ---
 def run_fast_simulation(tasks, risks, std_risks, n):
     base_sum = tasks["Duration (Days)"].sum()
     total_days = np.full(n, base_sum, dtype=float)
@@ -60,7 +59,7 @@ def run_fast_simulation(tasks, risks, std_risks, n):
         
     return total_days.astype(int)
 
-# --- SIDEBAR ---
+# --- 4. SIDEBAR ---
 with st.sidebar:
     st.header("👤 Menü")
     if st.button("Abmelden"):
@@ -82,15 +81,29 @@ with st.sidebar:
     ]
     selected_std = [sr for sr in STANDARD_RISKS if st.checkbox(sr["name"])]
 
-# --- HAUPTBEREICH ---
+# --- 5. HAUPTBEREICH ---
 st.title(f"🎲 Project Risk Simulator Pro")
-st.caption(f"Eingeloggt | Version {APP_VERSION}")
 
-# Session State Init
+# Session State Initialisierung für Tabellen
+#if "tasks" not in st.session_state:
+#    st.session_state.tasks = pd.DataFrame({"Task Name": ["Entwicklung", "QA"], "Duration (Days)": [20, 10]})
+#if "risks" not in st.session_state:
+#    st.session_state.risks = pd.DataFrame(columns=["Risk Name", "Target (Global/Task)", "Risk Type", "Probability (0-1)", "Impact Min", "Impact Likely", "Impact Max"])
+
+# --- AUTOMATISCHES LADEN BEIM START ---
 if "tasks" not in st.session_state:
-    st.session_state.tasks = pd.DataFrame({"Task Name": ["Entwicklung", "QA"], "Duration (Days)": [20, 10]})
+    try:
+        # Versuche Daten aus Google Sheets zu lesen
+        st.session_state.tasks = conn.read(worksheet="Tasks")
+    except Exception:
+        # Falls Sheet leer oder Fehler: Nutze Standardwerte
+        st.session_state.tasks = pd.DataFrame({"Task Name": ["Entwicklung", "QA"], "Duration (Days)": [20, 10]})
+
 if "risks" not in st.session_state:
-    st.session_state.risks = pd.DataFrame(columns=["Risk Name", "Target (Global/Task)", "Risk Type", "Probability (0-1)", "Impact Min", "Impact Likely", "Impact Max"])
+    try:
+        st.session_state.risks = conn.read(worksheet="Risks")
+    except Exception:
+        st.session_state.risks = pd.DataFrame(columns=["Risk Name", "Target (Global/Task)", "Risk Type", "Probability (0-1)", "Impact Min", "Impact Likely", "Impact Max"])
 
 # Eingabe-Formular
 with st.form("input_data_form_final"):
@@ -107,13 +120,20 @@ with st.form("input_data_form_final"):
         }
         ed_risks = st.data_editor(st.session_state.risks, column_config=risk_cfg, use_container_width=True, num_rows="dynamic", key="risk_edit_main")
     
-    if st.form_submit_button("💾 Daten fixieren"):
+    if st.form_submit_button("💾 Daten fixieren & in Google Cloud speichern"):
         st.session_state.tasks, st.session_state.risks = ed_tasks, ed_risks
-        st.success("Daten fixiert!")
+        
+        # --- GOOGLE SHEETS UPDATE ---
+        try:
+            conn.update(worksheet="Tasks", data=st.session_state.tasks)
+            conn.update(worksheet="Risks", data=st.session_state.risks)
+            st.success("Daten lokal fixiert und erfolgreich in Google Sheets synchronisiert!")
+        except Exception as e:
+            st.error(f"Fehler beim Google Sheets Update: {e}")
 
 # Simulation starten
 if st.button("🚀 Simulation starten"):
-    with st.spinner("Berechne..."):
+    with st.spinner("Berechne Szenarien..."):
         durations = run_fast_simulation(st.session_state.tasks, st.session_state.risks, selected_std, n_sim)
         start_np = np.datetime64(start_date)
         end_dates = pd.to_datetime(np.busday_offset(start_np, durations, roll='forward'))
@@ -126,11 +146,8 @@ if st.button("🚀 Simulation starten"):
         
         fig.update_layout(
             yaxis2=dict(overlaying="y", side="right", range=[0, 100]),
-            template="plotly_white", 
-            height=450, 
-            margin=dict(l=20, r=20, t=40, b=20)
+            template="plotly_white", height=450, margin=dict(l=20, r=20, t=40, b=20)
         )
-        
         fig.add_vline(x=commit_85.timestamp()*1000, line_dash="dash", line_color="red")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -139,8 +156,3 @@ if st.button("🚀 Simulation starten"):
         m1.metric("85% Sicherheit", commit_85.strftime('%d.%m.%Y'))
         m2.metric("Ø Dauer", f"{int(np.mean(durations))} Tage")
         m3.metric("Pessimistisch (95%)", pd.Series(end_dates).quantile(0.95).strftime('%d.%m.%Y'))
-
-# Export
-st.divider()
-csv = st.session_state.risks.to_csv(index=False).encode('utf-8')
-st.download_button("📥 Risiko-Export (CSV)", data=csv, file_name="risk_data.csv", mime="text/csv", key="download_csv_main")
