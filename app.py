@@ -3,11 +3,11 @@ import pandas as pd
 import numpy as np
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
 
 # --- 1. SETUP & CONFIG ---
-APP_VERSION = "2.1.6 (Cleanup & Report Edition)"
+APP_VERSION = "2.1.7 (Stable Date Edition)"
 DB_FILE = "risk_management.db"
 
 st.set_page_config(page_title=f"Risk Sim Pro v{APP_VERSION}", layout="wide")
@@ -51,6 +51,14 @@ def load_risks(project):
     conn.close()
     return df
 
+def delete_project_complete(project):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM tasks WHERE project=?", (project,))
+    conn.execute("DELETE FROM risks WHERE project=?", (project,))
+    conn.execute("DELETE FROM history WHERE project=?", (project,))
+    conn.commit()
+    conn.close()
+
 def save_history(project, target_date, buffer, top_risk):
     conn = get_db_connection()
     conn.execute("INSERT INTO history (project, timestamp, target_date, buffer, top_risk) VALUES (?,?,?,?,?)",
@@ -63,14 +71,6 @@ def load_history(project):
     df = pd.read_sql("SELECT timestamp, target_date, buffer, top_risk FROM history WHERE project=? ORDER BY id ASC", conn, params=(project,))
     conn.close()
     return df
-
-def delete_entire_project(project):
-    conn = get_db_connection()
-    conn.execute("DELETE FROM tasks WHERE project=?", (project,))
-    conn.execute("DELETE FROM risks WHERE project=?", (project,))
-    conn.execute("DELETE FROM history WHERE project=?", (project,))
-    conn.commit()
-    conn.close()
 
 def save_data(project, df_tasks, df_risks):
     conn = get_db_connection()
@@ -117,22 +117,20 @@ with st.sidebar:
             save_data(new_p, load_tasks(selected_proj), load_risks(selected_proj))
             st.rerun()
         
-        st.divider()
         t_exp = load_tasks(selected_proj)
         r_exp = load_risks(selected_proj)
         export_payload = json.dumps({"project": selected_proj, "tasks": t_exp.to_dict(orient="records"), "risks": r_exp.to_dict(orient="records")}, indent=2)
         st.download_button("📤 Projekt Export (JSON)", export_payload, f"{selected_proj}_export.json")
 
         st.divider()
-        st.subheader("⚠️ Gefahr")
-        confirm_del = st.checkbox("Löschen bestätigen")
-        if st.button(f"🗑️ {selected_proj} löschen"):
+        st.subheader("🗑️ Projekt löschen")
+        confirm_del = st.checkbox("Löschen unwiderruflich bestätigen")
+        if st.button(f"Lösche {selected_proj}"):
             if confirm_del:
-                delete_entire_project(selected_proj)
-                st.success(f"Projekt {selected_proj} gelöscht.")
+                delete_project_complete(selected_proj)
                 st.rerun()
             else:
-                st.warning("Bitte Bestätigungshaken setzen!")
+                st.warning("Haken zur Bestätigung setzen!")
 
     st.divider()
     st.subheader("📊 Szenarien-Vergleich")
@@ -175,7 +173,7 @@ ed_r = st.data_editor(r_curr, use_container_width=True, num_rows="dynamic", key=
 if st.button("💾 Risiken speichern"):
     save_data(selected_proj, ed_t, ed_r); st.rerun()
 
-# --- 7. SIMULATION & TREND ANALYTICS ---
+# --- 7. SIMULATION & ANALYTICS ---
 def run_fast_simulation(tasks, risks, std_risks, n):
     task_durations = np.tile(tasks["Duration (Days)"].values, (n, 1)).astype(float)
     base_sum = tasks["Duration (Days)"].sum()
@@ -203,15 +201,23 @@ def run_fast_simulation(tasks, risks, std_risks, n):
     for sr in std_risks:
         hits, impacts = np.random.random(n) < sr["prob"], np.random.triangular(sr["min"], sr["likely"], sr["max"], n)
         total_days *= (1 + (hits * impacts))
+    
+    # SAFETY CAP: Gedeckelt auf 10.000 Tage um OutOfBounds Datetime zu verhindern
+    total_days = np.clip(total_days, 0, 10000)
     return total_days.astype(int), pd.DataFrame(impact_results)
 
 st.divider()
 
 if st.button("🚀 Simulation starten & Trend analysieren"):
-    with st.spinner("Monte-Carlo & Impact-Ranking..."):
+    with st.spinner("Monte-Carlo Berechnung..."):
         durations, impact_df = run_fast_simulation(t_curr, ed_r, selected_std, n_sim)
         start_np = np.datetime64(start_date)
-        end_dates = pd.to_datetime(np.busday_offset(start_np, durations, roll='forward'))
+        
+        # Sicherer Datums-Offset
+        offsets = durations.astype('timedelta64[D]')
+        end_dates_np = start_np + offsets
+        end_dates = pd.to_datetime(end_dates_np, errors='coerce')
+        
         commit_85 = pd.Series(end_dates).quantile(0.85)
         st.session_state.last_durations, st.session_state.last_commit_85 = durations, commit_85
         
@@ -238,21 +244,21 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
         # --- UI DISPLAY ---
         if "⚠️" in warning_msg: st.error(warning_msg)
         else: st.success(warning_msg)
-        st.info(f"**Projektleiter-Anweisung:** {rec}")
+        st.info(f"**Anweisung:** {rec}")
 
-        col_left, col_right = st.columns([2, 1])
-        with col_left:
+        col_l, col_r = st.columns([2, 1])
+        with col_l:
             fig = go.Figure()
             fig.add_trace(go.Histogram(x=end_dates, name="Aktuell", marker_color="#1f77b4", opacity=0.6))
             if st.session_state.snapshot_date:
-                ref_ends = pd.to_datetime(np.busday_offset(start_np, st.session_state.snapshot_durations, roll='forward'))
+                ref_ends = pd.to_datetime(np.busday_offset(start_np, st.session_state.snapshot_durations.astype(int), roll='forward'), errors='coerce')
                 fig.add_trace(go.Histogram(x=ref_ends, name="Referenz", marker_color="#7f7f7f", opacity=0.3))
                 fig.add_vline(x=st.session_state.snapshot_date.timestamp()*1000, line_dash="dash", line_color="#7f7f7f", annotation_text=f"Ref: {st.session_state.snapshot_date.strftime('%d.%m.%Y')}")
             fig.add_vline(x=commit_85.timestamp()*1000, line_dash="solid", line_color="red", annotation_text="85% Ziel")
             fig.update_layout(template="plotly_white", barmode='overlay', height=400)
             st.plotly_chart(fig, use_container_width=True)
 
-        with col_right:
+        with col_r:
             st.metric("Zieltermin (85%)", commit_85.strftime('%d.%m.%Y'), delta=f"{diff} Tage" if not history_df.empty else None, delta_color="inverse")
             st.metric("Pufferbedarf (Ø)", f"{int(np.mean(durations) - t_curr['Duration (Days)'].sum())} Tage")
             st.subheader("🔥 Top Treiber")
@@ -275,9 +281,8 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
             fig_trend.update_layout(template="plotly_white", yaxis_title="Zieltermin", height=300)
             st.plotly_chart(fig_trend, use_container_width=True)
 
-        # --- VOLLSTÄNDIGER MANAGEMENT REPORT ---
+        # --- REPORT EXPORT ---
         st.subheader("📜 Management Report")
-        
         task_list_str = "".join([f"- {row['Task Name']}: {row['Duration (Days)']} Tage\n" for _, row in t_curr.iterrows()])
         risk_list_str = "".join([f"- {row['Risk Name']} ({row['Risk Type']}): {row['Probability (0-1)']} P | Ziel: {row['Target (Global/Task)']}\n" for _, row in ed_r.iterrows()])
         
@@ -286,7 +291,6 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
             ranked = impact_df.sort_values("Verzögerung", ascending=False)
             impact_ranking_str = "".join([f"- {row['Quelle']}: ~{row['Verzögerung']:.1f} Tage ({row['Typ']})\n" for _, row in ranked.iterrows()])
 
-        # Formatierung der Historie für den Report
         hist_report_df = history_df.tail(10).copy()
         try:
             hist_report_df['timestamp'] = pd.to_datetime(hist_report_df['timestamp']).dt.strftime('%d.%m.%Y %H:%M')
