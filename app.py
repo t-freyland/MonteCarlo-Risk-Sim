@@ -6,7 +6,7 @@ from datetime import datetime
 import plotly.graph_objects as go
 
 # --- 1. SETUP ---
-APP_VERSION = "2.0.4 (SQL Edition)"
+APP_VERSION = "2.0.5 (SQL Edition)"
 PROJECTS = ["Projekt_Alpha", "Projekt_Beta", "Projekt_Gamma", "Test_Sandbox"]
 DB_FILE = "risk_management.db"
 
@@ -130,45 +130,54 @@ if st.button("💾 Risiken speichern", key="save_r"):
     st.success("Risiken gespeichert!")
     st.rerun()
 
-# --- 7. SIMULATION ---
+# --- 7. SIMULATIONS-LOGIK MIT IMPACT-ANALYSE ---
 def run_fast_simulation(tasks, risks, std_risks, n):
-    # Basis Matrix
+    # Basis
     task_durations = np.tile(tasks["Duration (Days)"].values, (n, 1)).astype(float)
     base_sum = tasks["Duration (Days)"].sum()
+    impact_results = []
     
-    # 1. Projektspezifische Risiken
+    # 1. Spezifische Risiken berechnen
     for _, r in risks.iterrows():
         p = float(r.get("Probability (0-1)", 0))
         if p <= 0: continue
         
         vals = sorted([float(r.get("Impact Min", 0)), float(r.get("Impact Likely", 0)), float(r.get("Impact Max", 0))])
-        target, r_type = str(r.get("Target (Global/Task)", "Global")), str(r.get("Risk Type", "Binär"))
+        target, r_name = str(r.get("Target (Global/Task)", "Global")), str(r.get("Risk Name", "Unbekannt"))
         
         hits = np.random.random(n) < p
         impacts = np.random.triangular(vals[0], vals[1], max(vals[1]+0.001, vals[2]), n)
         
+        delay_contribution = 0
         if target == "Global":
-            if r_type == "Kontinuierlich":
+            delay_contribution = (hits * impacts * base_sum).mean()
+            if str(r.get("Risk Type")) == "Kontinuierlich":
                 task_durations *= (1 + (hits * impacts))
             else:
                 task_durations += (hits * impacts * base_sum / len(tasks)).reshape(-1, 1)
         else:
             if target in tasks["Task Name"].values:
                 idx = tasks.index[tasks["Task Name"] == target][0]
-                if r_type == "Kontinuierlich":
+                t_dur = tasks.iloc[idx]["Duration (Days)"]
+                delay_contribution = (hits * impacts * t_dur).mean()
+                if str(r.get("Risk Type")) == "Kontinuierlich":
                     task_durations[:, idx] *= (1 + (hits * impacts))
                 else:
-                    task_durations[:, idx] += (hits * impacts * tasks.iloc[idx]["Duration (Days)"])
+                    task_durations[:, idx] += (hits * impacts * t_dur)
+        
+        impact_results.append({"Risiko": r_name, "Ø Verzögerung (Tage)": round(delay_contribution, 1)})
 
     total_days = task_durations.sum(axis=1)
     
-    # 2. Standard Risiken anwenden (immer global/kontinuierlich)
+    # 2. Standard-Risiken
     for sr in std_risks:
         hits = np.random.random(n) < sr["prob"]
         impacts = np.random.triangular(sr["min"], sr["likely"], sr["max"], n)
+        delay_avg = (total_days * (hits * impacts)).mean()
         total_days = total_days * (1 + (hits * impacts))
+        impact_results.append({"Risiko": f"STD: {sr['name']}", "Ø Verzögerung (Tage)": round(delay_avg, 1)})
         
-    return total_days.astype(int)
+    return total_days.astype(int), pd.DataFrame(impact_results)
 
 st.divider()
 
@@ -176,8 +185,8 @@ if st.button("🚀 Simulation starten"):
     if t_curr["Duration (Days)"].sum() <= 0:
         st.warning("Keine Task-Dauer vorhanden.")
     else:
-        with st.spinner("Monte-Carlo läuft..."):
-            durations = run_fast_simulation(t_curr, ed_r, selected_std, n_sim)
+        with st.spinner("Monte-Carlo & Sensitivitäts-Analyse läuft..."):
+            durations, impact_df = run_fast_simulation(t_curr, ed_r, selected_std, n_sim)
             start_np = np.datetime64(start_date)
             end_dates = pd.to_datetime(np.busday_offset(start_np, durations, roll='forward'))
             commit_85 = pd.Series(end_dates).quantile(0.85)
@@ -185,19 +194,25 @@ if st.button("🚀 Simulation starten"):
             st.session_state.last_durations = durations
             st.session_state.last_commit_85 = commit_85
 
-            # Grafik
-            fig = go.Figure()
-            fig.add_trace(go.Histogram(x=end_dates, name="Aktuell", marker_color="#1f77b4", opacity=0.7))
-            
-            if st.session_state.snapshot_date:
-                ref_ends = pd.to_datetime(np.busday_offset(start_np, st.session_state.snapshot_durations, roll='forward'))
-                fig.add_trace(go.Histogram(x=ref_ends, name="Referenz", marker_color="#7f7f7f", opacity=0.3))
-                fig.add_vline(x=st.session_state.snapshot_date.timestamp()*1000, line_dash="dash", line_color="#7f7f7f")
-                
-            fig.add_vline(x=commit_85.timestamp()*1000, line_dash="dash", line_color="red")
-            fig.update_layout(barmode='overlay', template="plotly_white")
-            st.plotly_chart(fig, use_container_width=True)
+            # ERGEBNISSE
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                fig = go.Figure()
+                fig.add_trace(go.Histogram(x=end_dates, name="Aktuell", marker_color="#1f77b4", opacity=0.7))
+                if st.session_state.snapshot_date:
+                    ref_ends = pd.to_datetime(np.busday_offset(start_np, st.session_state.snapshot_durations, roll='forward'))
+                    fig.add_trace(go.Histogram(x=ref_ends, name="Referenz", marker_color="#7f7f7f", opacity=0.3))
+                fig.add_vline(x=commit_85.timestamp()*1000, line_dash="dash", line_color="red", annotation_text="85% Sicherheit")
+                fig.update_layout(barmode='overlay', template="plotly_white", margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig, use_container_width=True)
 
-            m1, m2 = st.columns(2)
-            m1.metric("Zieltermin (85%)", commit_85.strftime('%d.%m.%Y'))
-            m2.metric("Ø Dauer", f"{int(np.mean(durations))} Tage")
+            with c2:
+                st.metric("Zieltermin (85%)", commit_85.strftime('%d.%m.%Y'))
+                st.metric("Ø Dauer", f"{int(np.mean(durations))} Tage")
+                
+                st.subheader("🔥 Top Zeitfresser")
+                if not impact_df.empty:
+                    impact_df = impact_df.sort_values("Ø Verzögerung (Tage)", ascending=False)
+                    st.dataframe(impact_df, use_container_width=True, hide_index=True, column_config={
+                        "Ø Verzögerung (Tage)": st.column_config.ProgressColumn(format="%f d", min_value=0, max_value=float(impact_df["Ø Verzögerung (Tage)"].max() if not impact_df.empty else 100))
+                    })
