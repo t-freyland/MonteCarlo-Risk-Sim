@@ -7,7 +7,7 @@ from datetime import datetime
 import plotly.graph_objects as go
 
 # --- 1. SETUP & CONFIG ---
-APP_VERSION = "2.1.5"
+APP_VERSION = "2.1.6 (Cleanup & Report Edition)"
 DB_FILE = "risk_management.db"
 
 st.set_page_config(page_title=f"Risk Sim Pro v{APP_VERSION}", layout="wide")
@@ -49,7 +49,6 @@ def load_risks(project):
     conn = get_db_connection()
     df = pd.read_sql("SELECT risk_name as 'Risk Name', risk_type as 'Risk Type', target as 'Target (Global/Task)', prob as 'Probability (0-1)', impact_min as 'Impact Min', impact_likely as 'Impact Likely', impact_max as 'Impact Max', mitigation as 'Maßnahme / Mitigation' FROM risks WHERE project=?", conn, params=(project,))
     conn.close()
-    if df.empty: df = pd.DataFrame(columns=["Risk Name", "Risk Type", "Target (Global/Task)", "Probability (0-1)", "Impact Min", "Impact Likely", "Impact Max", "Maßnahme / Mitigation"])
     return df
 
 def save_history(project, target_date, buffer, top_risk):
@@ -64,6 +63,14 @@ def load_history(project):
     df = pd.read_sql("SELECT timestamp, target_date, buffer, top_risk FROM history WHERE project=? ORDER BY id ASC", conn, params=(project,))
     conn.close()
     return df
+
+def delete_entire_project(project):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM tasks WHERE project=?", (project,))
+    conn.execute("DELETE FROM risks WHERE project=?", (project,))
+    conn.execute("DELETE FROM history WHERE project=?", (project,))
+    conn.commit()
+    conn.close()
 
 def save_data(project, df_tasks, df_risks):
     conn = get_db_connection()
@@ -110,10 +117,22 @@ with st.sidebar:
             save_data(new_p, load_tasks(selected_proj), load_risks(selected_proj))
             st.rerun()
         
+        st.divider()
         t_exp = load_tasks(selected_proj)
         r_exp = load_risks(selected_proj)
         export_payload = json.dumps({"project": selected_proj, "tasks": t_exp.to_dict(orient="records"), "risks": r_exp.to_dict(orient="records")}, indent=2)
         st.download_button("📤 Projekt Export (JSON)", export_payload, f"{selected_proj}_export.json")
+
+        st.divider()
+        st.subheader("⚠️ Gefahr")
+        confirm_del = st.checkbox("Löschen bestätigen")
+        if st.button(f"🗑️ {selected_proj} löschen"):
+            if confirm_del:
+                delete_entire_project(selected_proj)
+                st.success(f"Projekt {selected_proj} gelöscht.")
+                st.rerun()
+            else:
+                st.warning("Bitte Bestätigungshaken setzen!")
 
     st.divider()
     st.subheader("📊 Szenarien-Vergleich")
@@ -177,17 +196,13 @@ def run_fast_simulation(tasks, risks, std_risks, n):
                 idx = tasks.index[tasks["Task Name"] == target][0]
                 if str(r.get("Risk Type")) == "Kontinuierlich": task_durations[:, idx] *= (1 + (hits * impacts))
                 else: task_durations[:, idx] += (hits * impacts * tasks.iloc[idx]["Duration (Days)"])
-        
         avg_delay = (hits * impacts * relevant_duration).mean()
         impact_results.append({"Quelle": str(r["Risk Name"]), "Verzögerung": avg_delay, "Typ": "Projekt"})
     
     total_days = task_durations.sum(axis=1)
     for sr in std_risks:
         hits, impacts = np.random.random(n) < sr["prob"], np.random.triangular(sr["min"], sr["likely"], sr["max"], n)
-        avg_delay = (total_days * (hits * impacts)).mean()
         total_days *= (1 + (hits * impacts))
-        impact_results.append({"Quelle": sr["name"], "Verzögerung": avg_delay, "Typ": "Standard"})
-        
     return total_days.astype(int), pd.DataFrame(impact_results)
 
 st.divider()
@@ -245,7 +260,6 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
 
         # --- TORNADO CHART ---
         st.subheader("🎯 Risiko Impact Overview (Tornado Chart)")
-        
         if not impact_df.empty:
             impact_df = impact_df.sort_values("Verzögerung", ascending=True)
             fig_tornado = go.Figure(go.Bar(x=impact_df["Verzögerung"], y=impact_df["Quelle"], orientation='h', marker_color=['#EF553B' if t == "Projekt" else '#636EFA' for t in impact_df["Typ"]]))
@@ -272,6 +286,12 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
             ranked = impact_df.sort_values("Verzögerung", ascending=False)
             impact_ranking_str = "".join([f"- {row['Quelle']}: ~{row['Verzögerung']:.1f} Tage ({row['Typ']})\n" for _, row in ranked.iterrows()])
 
+        # Formatierung der Historie für den Report
+        hist_report_df = history_df.tail(10).copy()
+        try:
+            hist_report_df['timestamp'] = pd.to_datetime(hist_report_df['timestamp']).dt.strftime('%d.%m.%Y %H:%M')
+        except: pass
+
         report_content = f"""MANAGEMENT TREND & RISK REPORT - {selected_proj}
 Erstellt am: {datetime.now().strftime('%d.%m.%Y %H:%M')}
 ---------------------------------------------------------
@@ -293,8 +313,8 @@ Anweisung: {rec}
 5. RISIKO-REGISTER (DETAILS):
 {risk_list_str}
 
-6. HISTORISCHER VERLAUF:
-{history_df.tail(10).to_string(index=False)}
+6. HISTORISCHER VERLAUF (Letzte Messungen):
+{hist_report_df.to_string(index=False)}
 ---------------------------------------------------------
 Simulationseinstellungen: {n_sim} Durchläufe
 """
