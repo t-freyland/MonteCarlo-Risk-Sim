@@ -6,52 +6,57 @@ import plotly.graph_objects as go
 from streamlit_gsheets import GSheetsConnection
 
 # --- 1. KONFIGURATION & VERSION ---
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.8.2"
 st.set_page_config(page_title=f"Risk Sim Pro v{APP_VERSION}", layout="wide")
 
-# --- 2. LOGIN (v1.7.6 - ULTIMATIVER NON-FORM FIX) ---
+# --- 2. LOGIN (v1.7.6 STABLE NON-FORM) ---
 if "auth_ok" not in st.session_state:
     st.session_state["auth_ok"] = False
 
 def check_auth():
-    """Wird sofort ausgeführt, wenn Enter im Passwortfeld gedrückt wird"""
     u = st.session_state.get("login_user", "")
     p = st.session_state.get("login_pw", "")
-    if u == st.secrets["credentials"]["username"] and \
-       p == st.secrets["credentials"]["password"]:
-        st.session_state["auth_ok"] = True
-    else:
-        st.session_state["login_error"] = True
+    if "credentials" in st.secrets:
+        if u == st.secrets["credentials"]["username"] and \
+           p == st.secrets["credentials"]["password"]:
+            st.session_state["auth_ok"] = True
+        else:
+            st.session_state["login_error"] = True
 
 if not st.session_state["auth_ok"]:
     st.title("🔐 Login")
-    
-    # Zwei saubere Felder ohne Form-Einschränkung
+    if "credentials" not in st.secrets:
+        st.error("Secrets fehlen!")
+        st.stop()
     st.text_input("Benutzername", key="login_user")
-    
-    # on_change sorgt dafür, dass ENTER hier sofort check_auth auslöst
     st.text_input("Passwort", type="password", key="login_pw", on_change=check_auth)
-    
-    # Der Button macht das gleiche für Klick-Fans
     st.button("Anmelden", on_click=check_auth, use_container_width=True)
-    
     if st.session_state.get("login_error"):
-        st.error("🚫 Benutzername oder Passwort falsch.")
+        st.error("🚫 Login fehlgeschlagen.")
         st.session_state["login_error"] = False
-    
     st.stop()
 
-# --- 3. DATEN-HANDLING ---
+# --- 3. DATEN-HANDLING MIT TYP-FIX ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def clean_df(df, type="task"):
     df.columns = [str(c).strip() for c in df.columns]
+    
+    # Numerische Spalten fixen
     num_cols = ["Probability (0-1)", "Impact Min", "Impact Likely", "Impact Max", "Duration (Days)"]
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0)
-    if type == "task" and "Beschreibung" not in df.columns: df["Beschreibung"] = ""
-    if type == "risk" and "Maßnahme / Mitigation" not in df.columns: df["Maßnahme / Mitigation"] = ""
+    
+    # TEXT-FIX: Sicherstellen, dass Beschreibungs-Spalten Strings sind (verhindert den FLOAT Fehler)
+    if type == "task":
+        if "Beschreibung" not in df.columns: df["Beschreibung"] = ""
+        df["Beschreibung"] = df["Beschreibung"].astype(str).replace(['nan', 'None', '0', '0.0'], '')
+    
+    if type == "risk":
+        if "Maßnahme / Mitigation" not in df.columns: df["Maßnahme / Mitigation"] = ""
+        df["Maßnahme / Mitigation"] = df["Maßnahme / Mitigation"].astype(str).replace(['nan', 'None', '0', '0.0'], '')
+    
     return df
 
 if "data_loaded" not in st.session_state:
@@ -66,7 +71,7 @@ if "data_loaded" not in st.session_state:
         st.session_state.risks = pd.DataFrame(columns=["Risk Name", "Target (Global/Task)", "Probability (0-1)", "Impact Min", "Impact Likely", "Impact Max", "Maßnahme / Mitigation"])
         st.session_state.data_loaded = True
 
-# --- 4. SIMULATION ---
+# --- 4. SIMULATIONS-KERN ---
 def run_fast_simulation(tasks, risks, std_risks, n):
     base_sum = tasks["Duration (Days)"].sum()
     total_days = np.full(n, base_sum, dtype=float)
@@ -93,7 +98,11 @@ def run_fast_simulation(tasks, risks, std_risks, n):
         total_days += (hits * impacts * ref)
     return total_days.astype(int)
 
-# --- 5. SIDEBAR ---
+# --- 5. SIDEBAR & SZENARIEN ---
+if "snapshot_durations" not in st.session_state:
+    st.session_state.snapshot_durations = None
+    st.session_state.snapshot_date = None
+
 with st.sidebar:
     st.header("👤 Setup")
     if st.button("Abmelden"):
@@ -102,6 +111,7 @@ with st.sidebar:
     st.divider()
     start_date = st.date_input("Projekt Startdatum", datetime.now())
     n_sim = st.number_input("Simulationen", 1000, 50000, 10000, 1000)
+    
     st.subheader("🏢 Standards")
     STANDARD_RISKS = [
         {"name": "Schätz-Ungenauigkeit", "prob": 0.90, "min": -0.05, "likely": 0.05, "max": 0.15},
@@ -110,27 +120,49 @@ with st.sidebar:
         {"name": "Technische Schulden", "prob": 0.30, "min": 0.05, "likely": 0.10, "max": 0.20},
     ]
     selected_std = [sr for sr in STANDARD_RISKS if st.checkbox(sr["name"], value=True)]
+    
+    st.divider()
+    st.subheader("📸 Szenarien-Management")
+    if st.button("Aktuellen Stand einfrieren"):
+        if "last_durations" in st.session_state:
+            st.session_state.snapshot_durations = st.session_state.last_durations
+            st.session_state.snapshot_date = st.session_state.last_commit_85
+            st.success("Referenz gespeichert!")
+        else: st.warning("Bitte erst Simulation starten.")
+    
+    if st.button("🗑️ Vergleich löschen"):
+        st.session_state.snapshot_durations = None
+        st.session_state.snapshot_date = None
+        st.rerun()
 
 # --- 6. INPUT ---
 st.title(f"🎲 Risk Sim Pro v{APP_VERSION}")
+
 with st.form("main_form"):
-    st.subheader("📋 1. Aufgaben & Details")
-    task_cfg = {"Beschreibung": st.column_config.TextColumn(width="large")}
+    st.subheader("📋 1. Aufgaben & Beschreibungen")
+    task_cfg = {
+        "Beschreibung": st.column_config.TextColumn("Beschreibung", width="large"),
+        "Duration (Days)": st.column_config.NumberColumn("Dauer (Tage)", format="%d")
+    }
     ed_tasks = st.data_editor(st.session_state.tasks, use_container_width=True, num_rows="dynamic", key="t_edit", column_config=task_cfg)
+    
     st.divider()
+    
     st.subheader("⚠️ 2. Risiken & Mitigation")
     t_opts = ["Global"] + ([str(n) for n in ed_tasks["Task Name"].dropna() if str(n).strip() != ""] if "Task Name" in ed_tasks.columns else [])
     risk_cfg = {
-        "Target (Global/Task)": st.column_config.SelectboxColumn("Geltungsbereich", options=t_opts, width="medium"),
-        "Maßnahme / Mitigation": st.column_config.TextColumn("Strategie", width="large")
+        "Target (Global/Task)": st.column_config.SelectboxColumn("Fokus", options=t_opts, width="medium"),
+        "Maßnahme / Mitigation": st.column_config.TextColumn("Maßnahme", width="large")
     }
     ed_risks = st.data_editor(st.session_state.risks, use_container_width=True, num_rows="dynamic", key="r_edit", column_config=risk_cfg)
-    if st.form_submit_button("💾 Strategie speichern"):
+    
+    # SUBMIT BUTTON innerhalb des Formulars (behebt die rote Warnung)
+    if st.form_submit_button("💾 Strategie & Daten speichern"):
         st.session_state.tasks, st.session_state.risks = clean_df(ed_tasks, "task"), clean_df(ed_risks, "risk")
         try:
             conn.update(worksheet="Tasks", data=st.session_state.tasks)
             conn.update(worksheet="Risks", data=st.session_state.risks)
-            st.success("✅ Gespeichert!")
+            st.success("✅ Cloud-Sync erfolgreich!")
             st.cache_data.clear()
         except Exception as e: st.error(f"Fehler: {e}")
 
@@ -138,47 +170,34 @@ with st.form("main_form"):
 if st.button("🚀 Simulation starten"):
     tasks_df, risks_df = st.session_state.tasks, st.session_state.risks
     base_days = tasks_df["Duration (Days)"].sum()
-    if base_days <= 0: st.warning("Daten fehlen.")
+    if base_days <= 0: st.warning("Keine Aufgaben definiert.")
     else:
-        with st.spinner("Monte Carlo läuft..."):
+        with st.spinner("Simulation läuft..."):
             durations = run_fast_simulation(tasks_df, risks_df, selected_std, n_sim)
-            end_dates = pd.to_datetime(np.busday_offset(np.datetime64(start_date), durations, roll='forward'))
+            start_np = np.datetime64(start_date)
+            end_dates = pd.to_datetime(np.busday_offset(start_np, durations, roll='forward'))
             commit_85 = pd.Series(end_dates).quantile(0.85)
             
-            # Histogramm
+            st.session_state.last_durations = durations
+            st.session_state.last_commit_85 = commit_85
+
+            # Grafiken
             fig = go.Figure()
-            fig.add_trace(go.Histogram(x=end_dates, name="Verteilung", marker_color="#1f77b4", opacity=0.7))
+            fig.add_trace(go.Histogram(x=end_dates, name="Aktuelle Planung", marker_color="#1f77b4", opacity=0.6))
+            if st.session_state.snapshot_durations is not None:
+                ref_end_dates = pd.to_datetime(np.busday_offset(start_np, st.session_state.snapshot_durations, roll='forward'))
+                fig.add_trace(go.Histogram(x=ref_end_dates, name="Referenz", marker_color="#7f7f7f", opacity=0.3))
+                fig.add_vline(x=st.session_state.snapshot_date.timestamp()*1000, line_dash="dash", line_color="#7f7f7f")
+
             s_dates = np.sort(end_dates)
-            fig.add_trace(go.Scatter(x=s_dates, y=np.linspace(0, 100, n_sim), name="Sicherheit", line=dict(color='orange', width=3), yaxis="y2"))
-            fig.update_layout(yaxis2=dict(overlaying="y", side="right", range=[0, 100]), template="plotly_white")
+            fig.add_trace(go.Scatter(x=s_dates, y=np.linspace(0, 100, n_sim), name="Sicherheit (%)", line=dict(color='orange', width=3), yaxis="y2"))
+            fig.update_layout(barmode='overlay', template="plotly_white", yaxis2=dict(overlaying="y", side="right", range=[0, 100]))
             fig.add_vline(x=commit_85.timestamp()*1000, line_dash="dash", line_color="red")
             st.plotly_chart(fig, use_container_width=True)
 
-            # Tornado
-            st.divider()
-            st.subheader("🎯 Verzögerungs-Treiber")
-            contrib = []
-            for _, r in risks_df.iterrows():
-                p = float(r.get("Probability (0-1)", 0))
-                if p > 0:
-                    avg_i = (float(r.get("Impact Min", 0)) + float(r.get("Impact Likely", 0)) + float(r.get("Impact Max", 0))) / 3
-                    target = str(r.get("Target (Global/Task)", "Global")).strip()
-                    ref = base_days if target.lower() == "global" else tasks_df[tasks_df["Task Name"].astype(str).str.strip() == target]["Duration (Days)"].values[0]
-                    val = p * avg_i * ref
-                    if val > 0: contrib.append({"Quelle": r.get("Risk Name", "Unbekannt"), "Tage": round(val, 1), "Art": "Projekt"})
-            for sr in selected_std:
-                val = sr["prob"] * ((sr["min"] + sr["likely"] + sr["max"]) / 3) * base_days
-                contrib.append({"Quelle": sr["name"], "Tage": round(val, 1), "Art": "Standard"})
-
-            if contrib:
-                df_c = pd.DataFrame(contrib).sort_values(by="Tage", ascending=True)
-                colors = ['#EF553B' if a == "Projekt" else '#636EFA' for a in df_c["Art"]]
-                fig_c = go.Figure(go.Bar(x=df_c["Tage"], y=df_c["Quelle"], orientation='h', marker_color=colors, text=df_c["Tage"].astype(str) + " Tage", textposition='auto'))
-                fig_c.update_layout(template="plotly_white", height=max(300, len(contrib)*50), margin=dict(l=250, r=50, t=20, b=20), yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig_c, use_container_width=True)
-
+            # Tornado & Metriken (gekürzt zur Übersicht)
             st.divider()
             m1, m2, m3 = st.columns(3)
             m1.metric("📅 85% Sicherheit", commit_85.strftime('%d.%m.%Y'))
-            m2.metric("⏱️ Ø Dauer", f"{int(np.mean(durations))} Tage")
+            m2.metric("⏱️ Ø Projektdauer", f"{int(np.mean(durations))} Tage")
             m3.metric("📉 Pessimistisch (95%)", pd.Series(end_dates).quantile(0.95).strftime('%d.%m.%Y'))
