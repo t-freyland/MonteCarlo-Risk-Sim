@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 
 # --- 1. SETUP & CONFIG ---
-APP_VERSION = "2.1.7 (Stable Date Edition)"
+APP_VERSION = "2.1.8 (Cleanup Edition)"
 DB_FILE = "risk_management.db"
 
 st.set_page_config(page_title=f"Risk Sim Pro v{APP_VERSION}", layout="wide")
@@ -55,6 +55,12 @@ def delete_project_complete(project):
     conn = get_db_connection()
     conn.execute("DELETE FROM tasks WHERE project=?", (project,))
     conn.execute("DELETE FROM risks WHERE project=?", (project,))
+    conn.execute("DELETE FROM history WHERE project=?", (project,))
+    conn.commit()
+    conn.close()
+
+def delete_history_only(project):
+    conn = get_db_connection()
     conn.execute("DELETE FROM history WHERE project=?", (project,))
     conn.commit()
     conn.close()
@@ -123,14 +129,21 @@ with st.sidebar:
         st.download_button("📤 Projekt Export (JSON)", export_payload, f"{selected_proj}_export.json")
 
         st.divider()
-        st.subheader("🗑️ Projekt löschen")
-        confirm_del = st.checkbox("Löschen unwiderruflich bestätigen")
+        st.subheader("🗑️ Daten bereinigen")
+        if st.button("📊 Historie (Zeitreihe) löschen"):
+            delete_history_only(selected_proj)
+            st.success("Historie gelöscht.")
+            st.rerun()
+
+        st.divider()
+        st.subheader("❗ Projekt löschen")
+        confirm_del = st.checkbox("Projekt unwiderruflich löschen")
         if st.button(f"Lösche {selected_proj}"):
             if confirm_del:
                 delete_project_complete(selected_proj)
                 st.rerun()
             else:
-                st.warning("Haken zur Bestätigung setzen!")
+                st.warning("Bestätigung erforderlich!")
 
     st.divider()
     st.subheader("📊 Szenarien-Vergleich")
@@ -139,6 +152,12 @@ with st.sidebar:
             st.session_state.snapshot_durations = st.session_state.last_durations
             st.session_state.snapshot_date = st.session_state.last_commit_85
             st.success("Referenz gespeichert!")
+    
+    if st.button("🗑️ Snapshot (Referenz) löschen"):
+        st.session_state.snapshot_durations = None
+        st.session_state.snapshot_date = None
+        st.info("Referenz entfernt.")
+        st.rerun()
     
     st.divider()
     st.subheader("🏢 Globale Standards")
@@ -202,7 +221,6 @@ def run_fast_simulation(tasks, risks, std_risks, n):
         hits, impacts = np.random.random(n) < sr["prob"], np.random.triangular(sr["min"], sr["likely"], sr["max"], n)
         total_days *= (1 + (hits * impacts))
     
-    # SAFETY CAP: Gedeckelt auf 10.000 Tage um OutOfBounds Datetime zu verhindern
     total_days = np.clip(total_days, 0, 10000)
     return total_days.astype(int), pd.DataFrame(impact_results)
 
@@ -213,7 +231,6 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
         durations, impact_df = run_fast_simulation(t_curr, ed_r, selected_std, n_sim)
         start_np = np.datetime64(start_date)
         
-        # Sicherer Datums-Offset
         offsets = durations.astype('timedelta64[D]')
         end_dates_np = start_np + offsets
         end_dates = pd.to_datetime(end_dates_np, errors='coerce')
@@ -221,7 +238,6 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
         commit_85 = pd.Series(end_dates).quantile(0.85)
         st.session_state.last_durations, st.session_state.last_commit_85 = durations, commit_85
         
-        # Trend Vergleich
         history_df = load_history(selected_proj)
         diff, warning_msg, rec = 0, "Erste Messung", "✅ Projekt im Plan."
         
@@ -235,13 +251,11 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
             elif diff < 0:
                 warning_msg = f"✨ POSITIVER TREND: Verbesserung um {abs(diff)} Tage."
 
-        # Speichern
         top_r = impact_df.sort_values("Verzögerung", ascending=False).iloc[0]["Quelle"] if not impact_df.empty else "N/A"
         if do_history:
             save_history(selected_proj, commit_85.strftime('%Y-%m-%d'), float(np.mean(durations)), top_r)
             history_df = load_history(selected_proj)
 
-        # --- UI DISPLAY ---
         if "⚠️" in warning_msg: st.error(warning_msg)
         else: st.success(warning_msg)
         st.info(f"**Anweisung:** {rec}")
@@ -264,7 +278,6 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
             st.subheader("🔥 Top Treiber")
             st.write(top_r)
 
-        # --- TORNADO CHART ---
         st.subheader("🎯 Risiko Impact Overview (Tornado Chart)")
         if not impact_df.empty:
             impact_df = impact_df.sort_values("Verzögerung", ascending=True)
@@ -272,7 +285,6 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
             fig_tornado.update_layout(template="plotly_white", xaxis_title="Ø Verzögerung in Arbeitstagen", height=max(300, len(impact_df)*35), margin=dict(l=200))
             st.plotly_chart(fig_tornado, use_container_width=True)
 
-        # --- FIEBERKURVE ---
         if not history_df.empty and len(history_df) > 1:
             st.subheader("📉 Fieberkurve (Trend des Zieltermins)")
             history_df['target_date_dt'] = pd.to_datetime(history_df['target_date'])
@@ -281,7 +293,6 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
             fig_trend.update_layout(template="plotly_white", yaxis_title="Zieltermin", height=300)
             st.plotly_chart(fig_trend, use_container_width=True)
 
-        # --- REPORT EXPORT ---
         st.subheader("📜 Management Report")
         task_list_str = "".join([f"- {row['Task Name']}: {row['Duration (Days)']} Tage\n" for _, row in t_curr.iterrows()])
         risk_list_str = "".join([f"- {row['Risk Name']} ({row['Risk Type']}): {row['Probability (0-1)']} P | Ziel: {row['Target (Global/Task)']}\n" for _, row in ed_r.iterrows()])
