@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 
 # --- 1. SETUP & CONFIG ---
-APP_VERSION = "2.1.8 (Cleanup Edition)"
+APP_VERSION = "2.1.9 (Reporting Master)"
 DB_FILE = "risk_management.db"
 
 st.set_page_config(page_title=f"Risk Sim Pro v{APP_VERSION}", layout="wide")
@@ -31,6 +31,7 @@ def init_db():
 
 init_db()
 
+# --- HILFSFUNKTIONEN ---
 def get_all_projects():
     conn = get_db_connection()
     df = pd.read_sql("SELECT DISTINCT project FROM tasks UNION SELECT DISTINCT project FROM risks", conn)
@@ -198,6 +199,7 @@ def run_fast_simulation(tasks, risks, std_risks, n):
     base_sum = tasks["Duration (Days)"].sum()
     impact_results = []
     
+    # Projekt-Risiken
     for _, r in risks.iterrows():
         p, vals = float(r.get("Probability (0-1)", 0)), sorted([float(r.get("Impact Min", 0)), float(r.get("Impact Likely", 0)), float(r.get("Impact Max", 0))])
         if p <= 0: continue
@@ -213,13 +215,21 @@ def run_fast_simulation(tasks, risks, std_risks, n):
                 idx = tasks.index[tasks["Task Name"] == target][0]
                 if str(r.get("Risk Type")) == "Kontinuierlich": task_durations[:, idx] *= (1 + (hits * impacts))
                 else: task_durations[:, idx] += (hits * impacts * tasks.iloc[idx]["Duration (Days)"])
+        
         avg_delay = (hits * impacts * relevant_duration).mean()
         impact_results.append({"Quelle": str(r["Risk Name"]), "Verzögerung": avg_delay, "Typ": "Projekt"})
-    
+
     total_days = task_durations.sum(axis=1)
+    
+    # Standard-Risiken in Simulation UND Analytics aufnehmen
     for sr in std_risks:
-        hits, impacts = np.random.random(n) < sr["prob"], np.random.triangular(sr["min"], sr["likely"], sr["max"], n)
+        hits = np.random.random(n) < sr["prob"]
+        impacts = np.random.triangular(sr["min"], sr["likely"], sr["max"], n)
+        
+        # Vorher-Nacher Vergleich für den Impact-Wert
+        delay_contribution = (total_days * (hits * impacts)).mean()
         total_days *= (1 + (hits * impacts))
+        impact_results.append({"Quelle": f"STD: {sr['name']}", "Verzögerung": delay_contribution, "Typ": "Standard"})
     
     total_days = np.clip(total_days, 0, 10000)
     return total_days.astype(int), pd.DataFrame(impact_results)
@@ -227,7 +237,7 @@ def run_fast_simulation(tasks, risks, std_risks, n):
 st.divider()
 
 if st.button("🚀 Simulation starten & Trend analysieren"):
-    with st.spinner("Monte-Carlo Berechnung..."):
+    with st.spinner("Berechne Monte-Carlo Trends..."):
         durations, impact_df = run_fast_simulation(t_curr, ed_r, selected_std, n_sim)
         start_np = np.datetime64(start_date)
         
@@ -278,21 +288,36 @@ if st.button("🚀 Simulation starten & Trend analysieren"):
             st.subheader("🔥 Top Treiber")
             st.write(top_r)
 
+        # --- TORNADO CHART (JETZT INKLUSIVE STANDARDS) ---
         st.subheader("🎯 Risiko Impact Overview (Tornado Chart)")
+        
         if not impact_df.empty:
             impact_df = impact_df.sort_values("Verzögerung", ascending=True)
-            fig_tornado = go.Figure(go.Bar(x=impact_df["Verzögerung"], y=impact_df["Quelle"], orientation='h', marker_color=['#EF553B' if t == "Projekt" else '#636EFA' for t in impact_df["Typ"]]))
+            fig_tornado = go.Figure(go.Bar(
+                x=impact_df["Verzögerung"], 
+                y=impact_df["Quelle"], 
+                orientation='h', 
+                marker_color=['#EF553B' if t == "Projekt" else '#636EFA' for t in impact_df["Typ"]]
+            ))
             fig_tornado.update_layout(template="plotly_white", xaxis_title="Ø Verzögerung in Arbeitstagen", height=max(300, len(impact_df)*35), margin=dict(l=200))
             st.plotly_chart(fig_tornado, use_container_width=True)
 
+        # --- FIEBERKURVE (OPTIMIERT) ---
         if not history_df.empty and len(history_df) > 1:
             st.subheader("📉 Fieberkurve (Trend des Zieltermins)")
             history_df['target_date_dt'] = pd.to_datetime(history_df['target_date'])
             fig_trend = go.Figure()
             fig_trend.add_trace(go.Scatter(x=history_df['timestamp'], y=history_df['target_date_dt'], mode='lines+markers', line=dict(color='firebrick', width=3)))
-            fig_trend.update_layout(template="plotly_white", yaxis_title="Zieltermin", height=300)
+            fig_trend.update_layout(
+                template="plotly_white", 
+                yaxis_title="Prognostizierter Zieltermin", 
+                xaxis_title="Messzeitpunkt",
+                yaxis={'tickformat': '%d.%m.%y'}, # Datum lesbar auf Y-Achse
+                height=350
+            )
             st.plotly_chart(fig_trend, use_container_width=True)
 
+        # --- MANAGEMENT REPORT ---
         st.subheader("📜 Management Report")
         task_list_str = "".join([f"- {row['Task Name']}: {row['Duration (Days)']} Tage\n" for _, row in t_curr.iterrows()])
         risk_list_str = "".join([f"- {row['Risk Name']} ({row['Risk Type']}): {row['Probability (0-1)']} P | Ziel: {row['Target (Global/Task)']}\n" for _, row in ed_r.iterrows()])
@@ -319,7 +344,7 @@ Anweisung: {rec}
 - Durchschnittliche Projektdauer: {np.mean(durations):.1f} Tage
 - Notwendiger Risiko-Puffer: {int(np.mean(durations) - t_curr['Duration (Days)'].sum())} Tage
 
-3. RISIKO-TREIBER (Ø Auswirkung):
+3. RISIKO-TREIBER (Ø Auswirkung inklusive Standards):
 {impact_ranking_str}
 
 4. PROJEKTSTRUKTUR (TASKS):
