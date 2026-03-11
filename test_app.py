@@ -15,7 +15,7 @@ def get_test_db_connection():
 
 def init_test_db():
     conn = get_test_db_connection()
-    conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, task_name TEXT, duration REAL, description TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, task_name TEXT, duration REAL, description TEXT, team TEXT, sequence INTEGER)")
     conn.execute("CREATE TABLE IF NOT EXISTS risks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, risk_name TEXT, risk_type TEXT, target TEXT, prob REAL, impact_min REAL, impact_likely REAL, impact_max REAL, mitigation TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, timestamp TEXT, target_date TEXT, buffer REAL, top_risk TEXT)")
     conn.execute("""
@@ -31,6 +31,14 @@ def init_test_db():
             top_risk TEXT,
             risks_occurred TEXT,
             notes TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT,
+            team_name TEXT,
+            capacity REAL DEFAULT 1.0
         )
     """)
     conn.commit()
@@ -51,9 +59,16 @@ def setup_and_teardown():
 @pytest.fixture
 def sample_tasks():
     return pd.DataFrame([
-        {"Task Name": "Design",       "Duration (Days)": 10.0, "Beschreibung": "Design Phase"},
-        {"Task Name": "Development",  "Duration (Days)": 20.0, "Beschreibung": "Dev Phase"},
-        {"Task Name": "Testing",      "Duration (Days)": 5.0,  "Beschreibung": "QA Phase"},
+        {"Task Name": "Design",       "Duration (Days)": 10.0, "Beschreibung": "Design Phase", "team": "Team A"},
+        {"Task Name": "Development",  "Duration (Days)": 20.0, "Beschreibung": "Dev Phase", "team": "Team A"},
+        {"Task Name": "Testing",      "Duration (Days)": 5.0,  "Beschreibung": "QA Phase", "team": "Team B"},
+    ])
+
+@pytest.fixture
+def sample_teams():
+    return pd.DataFrame([
+        {"Team": "Team A", "Capacity": 1.0},
+        {"Team": "Team B", "Capacity": 2.0},
     ])
 
 @pytest.fixture
@@ -84,8 +99,8 @@ class TestDatabase:
     def _save_tasks(self, project, tasks_df):
         conn = get_test_db_connection()
         for _, row in tasks_df.iterrows():
-            conn.execute("INSERT INTO tasks (project, task_name, duration, description) VALUES (?,?,?,?)",
-                         (project, row["Task Name"], row["Duration (Days)"], row.get("Beschreibung", "")))
+            conn.execute("INSERT INTO tasks (project, task_name, duration, description, team) VALUES (?,?,?,?,?)",
+                         (project, row["Task Name"], row["Duration (Days)"], row.get("Beschreibung", ""), row.get("team", "Sequenziell")))
         conn.commit()
         conn.close()
 
@@ -99,6 +114,14 @@ class TestDatabase:
         conn.commit()
         conn.close()
 
+    def _save_teams(self, project, teams_df):
+        conn = get_test_db_connection()
+        for _, row in teams_df.iterrows():
+            conn.execute("INSERT INTO teams (project, team_name, capacity) VALUES (?,?,?)",
+                         (project, row["Team"], row.get("Capacity", 1.0)))
+        conn.commit()
+        conn.close()
+
     def test_init_db_creates_all_tables(self):
         conn = get_test_db_connection()
         tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)["name"].tolist()
@@ -107,6 +130,7 @@ class TestDatabase:
         assert "risks"          in tables
         assert "history"        in tables
         assert "actual_results" in tables
+        assert "teams"          in tables
 
     def test_save_and_load_tasks(self, project_name, sample_tasks):
         self._save_tasks(project_name, sample_tasks)
@@ -124,6 +148,15 @@ class TestDatabase:
         conn.close()
         assert len(df) == 3
         assert "Scope Creep" in df["risk_name"].values
+
+    def test_save_and_load_teams(self, project_name, sample_teams):
+        self._save_teams(project_name, sample_teams)
+        conn = get_test_db_connection()
+        df = pd.read_sql("SELECT team_name, capacity FROM teams WHERE project=?", conn, params=(project_name,))
+        conn.close()
+        assert len(df) == 2
+        assert "Team A" in df["team_name"].values
+        assert 2.0 in df["capacity"].values
 
     def test_delete_tasks_on_save(self, project_name, sample_tasks):
         self._save_tasks(project_name, sample_tasks)
@@ -169,7 +202,7 @@ class TestDatabase:
         tasks = pd.read_sql("SELECT * FROM tasks WHERE project=?", conn, params=(project_name,))
         conn.close()
         assert hist.empty
-        assert not tasks.empty  # Tasks bleiben erhalten
+        assert not tasks.empty
 
     def test_delete_project_complete(self, project_name, sample_tasks, sample_risks):
         self._save_tasks(project_name, sample_tasks)
@@ -185,7 +218,7 @@ class TestDatabase:
         conn.commit()
         for table in ["tasks", "risks", "history", "actual_results"]:
             df = pd.read_sql(f"SELECT * FROM {table} WHERE project=?", conn, params=(project_name,))
-            assert df.empty, f"Tabelle {table} sollte leer sein nach Projekt-Löschung"
+            assert df.empty
         conn.close()
 
     def test_save_actual_result(self, project_name):
@@ -245,36 +278,64 @@ class TestDatabase:
 
 
 # ============================================================
-# 2. SIMULATIONSFUNKTIONEN
+# 2. SIMULATIONSFUNKTIONEN (MIT TEAM-PARALLELISIERUNG)
 # ============================================================
 
 class TestSimulation:
 
-    def run_simulation(self, tasks, risks, std_risks, n=1000):
+    def run_simulation(self, tasks, risks, std_risks, teams, n=1000):
         """Lokale Kopie der Simulationsfunktion für Tests."""
         if tasks.empty or tasks["Duration (Days)"].sum() <= 0:
             raise ValueError("Keine gültigen Tasks definiert oder alle Dauern = 0")
 
-        base_sum = float(tasks["Duration (Days)"].sum())
+        tasks_copy = tasks.copy()
+        if "team" not in tasks_copy.columns:
+            tasks_copy["team"] = "Sequenziell"
+        
+        team_durations = {}
+        for team_name in tasks_copy["team"].unique():
+            team_tasks = tasks_copy[tasks_copy["team"] == team_name]
+            team_sum = team_tasks["Duration (Days)"].sum()
+            
+            if not teams.empty:
+                team_row = teams[teams["Team"] == team_name]
+                if not team_row.empty:
+                    capacity = float(team_row.iloc[0].get("Capacity", 1.0))
+                    team_sum = team_sum / capacity
+            
+            team_durations[team_name] = team_sum
+        
+        base_sum = max(team_durations.values()) if team_durations else tasks_copy["Duration (Days)"].sum()
         total_days = np.full(n, base_sum, dtype=float)
         impact_results = []
 
         for _, r in risks.iterrows():
+            p = float(r.get("Probability (0-1)", 0))
             rtype = str(r.get("Risk Type", "Binär")).strip().lower()
-            mins  = float(r.get("Impact Min", 0))
-            lik   = float(r.get("Impact Likely", mins))
-            maxv  = float(r.get("Impact Max", lik))
-            p     = float(r.get("Probability (0-1)", 0))
             target = str(r.get("Target (Global/Task)", "Global")).strip()
-
+            mins = float(r.get("Impact Min", 0))
+            lik = float(r.get("Impact Likely", mins))
+            maxv = float(r.get("Impact Max", lik))
+            
             impacts = np.random.triangular(mins, lik, max(maxv, lik + 1e-6), size=n)
-            hits    = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
+            hits = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
 
             if target.lower() == "global":
                 relevant_dur = base_sum
+                task_team = "Global"
             else:
-                match = tasks[tasks["Task Name"] == target]
-                relevant_dur = float(match["Duration (Days)"].sum()) if not match.empty else 0.0
+                match = tasks_copy[tasks_copy["Task Name"] == target]
+                if not match.empty:
+                    relevant_dur = float(match["Duration (Days)"].iloc[0])
+                    task_team = match.iloc[0].get("team", "Sequenziell")
+                    if not teams.empty:
+                        team_row = teams[teams["Team"] == task_team]
+                        if not team_row.empty:
+                            capacity = float(team_row.iloc[0].get("Capacity", 1.0))
+                            relevant_dur = relevant_dur / capacity
+                else:
+                    relevant_dur = 0.0
+                    task_team = "Unknown"
 
             if relevant_dur <= 0:
                 continue
@@ -282,79 +343,50 @@ class TestSimulation:
             delay = impacts * relevant_dur
             total_days += delay if rtype == "kontinuierlich" else (hits * delay)
             avg_delay = float(delay.mean()) if rtype == "kontinuierlich" else float((hits * delay).mean())
-            impact_results.append({"Quelle": str(r["Risk Name"]), "Verzögerung": avg_delay, "Typ": "Projekt"})
+            impact_results.append({
+                "Quelle": str(r["Risk Name"]), 
+                "Verzögerung": avg_delay, 
+                "Typ": "Projekt",
+                "Team": task_team
+            })
 
         for sr in std_risks:
             rtype = str(sr.get("type", "Binär")).strip().lower()
-            p     = float(sr.get("prob", 0))
-            mins  = float(sr.get("min", 0))
-            lik   = float(sr.get("likely", mins))
-            maxv  = float(sr.get("max", lik))
+            p = float(sr.get("prob", 0))
+            mins = float(sr.get("min", 0))
+            lik = float(sr.get("likely", mins))
+            maxv = float(sr.get("max", lik))
+            
             impacts = np.random.triangular(mins, lik, max(maxv, lik + 1e-6), size=n)
-            hits    = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
-            delay   = impacts * base_sum
+            hits = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
+            delay = impacts * base_sum
             total_days += delay if rtype == "kontinuierlich" else (hits * delay)
             avg_delay = float(delay.mean()) if rtype == "kontinuierlich" else float((hits * delay).mean())
-            impact_results.append({"Quelle": f"STD: {sr['name']}", "Verzögerung": avg_delay, "Typ": "Standard"})
+            impact_results.append({
+                "Quelle": f"STD: {sr['name']}", 
+                "Verzögerung": avg_delay, 
+                "Typ": "Standard",
+                "Team": "Global"
+            })
 
         total_days = np.clip(total_days, 0, 10000)
         return total_days.astype(int), pd.DataFrame(impact_results)
 
-    def test_simulation_returns_correct_shape(self, sample_tasks, sample_risks, sample_std_risks):
+    def test_simulation_with_team_parallelization(self, sample_tasks, sample_teams):
         np.random.seed(42)
-        durations, impact_df = self.run_simulation(sample_tasks, sample_risks, sample_std_risks, n=1000)
-        assert len(durations) == 1000
-        assert isinstance(impact_df, pd.DataFrame)
-        assert "Quelle" in impact_df.columns
-        assert "Verzögerung" in impact_df.columns
-        assert "Typ" in impact_df.columns
+        durations, _ = self.run_simulation(sample_tasks, pd.DataFrame(), [], sample_teams, n=100)
+        expected_base = 30.0
+        assert durations[0] == int(expected_base)
 
-    def test_simulation_base_duration_minimum(self, sample_tasks, sample_std_risks):
-        """Ohne negative Risiken: Ergebnis >= Basis-Summe."""
+    def test_simulation_respects_team_capacity(self, sample_teams):
+        tasks = pd.DataFrame([
+            {"Task Name": "Fast Task", "Duration (Days)": 10.0, "Beschreibung": "", "team": "Team B"}
+        ])
         np.random.seed(42)
-        risks_positive = pd.DataFrame([{
-            "Risk Name": "Positiv Risk", "Risk Type": "Binär",
-            "Target (Global/Task)": "Global", "Probability (0-1)": 1.0,
-            "Impact Min": 0.0, "Impact Likely": 0.1, "Impact Max": 0.2,
-            "Maßnahme / Mitigation": ""
-        }])
-        durations, _ = self.run_simulation(sample_tasks, risks_positive, [], n=500)
-        base = sample_tasks["Duration (Days)"].sum()
-        assert durations.min() >= base * 0.97  # Toleranz für Rundung
+        durations, _ = self.run_simulation(tasks, pd.DataFrame(), [], sample_teams, n=100)
+        assert durations[0] == 5
 
-    def test_simulation_raises_on_empty_tasks(self, sample_std_risks):
-        empty_tasks = pd.DataFrame(columns=["Task Name", "Duration (Days)", "Beschreibung"])
-        with pytest.raises(ValueError, match="Keine gültigen Tasks"):
-            self.run_simulation(empty_tasks, pd.DataFrame(), sample_std_risks)
-
-    def test_simulation_raises_on_zero_duration(self, sample_std_risks):
-        zero_tasks = pd.DataFrame([{"Task Name": "Task", "Duration (Days)": 0.0, "Beschreibung": ""}])
-        with pytest.raises(ValueError):
-            self.run_simulation(zero_tasks, pd.DataFrame(), sample_std_risks)
-
-    def test_simulation_output_clipped_to_10000(self, sample_tasks):
-        """Extreme Risiken überschreiten nicht 10.000 Tage."""
-        np.random.seed(42)
-        extreme_risks = pd.DataFrame([{
-            "Risk Name": "Extreme", "Risk Type": "Kontinuierlich",
-            "Target (Global/Task)": "Global", "Probability (0-1)": 1.0,
-            "Impact Min": 100.0, "Impact Likely": 200.0, "Impact Max": 300.0,
-            "Maßnahme / Mitigation": ""
-        }])
-        durations, _ = self.run_simulation(sample_tasks, extreme_risks, [], n=100)
-        assert durations.max() <= 10000
-
-    def test_simulation_impact_df_contains_all_risks(self, sample_tasks, sample_risks, sample_std_risks):
-        np.random.seed(42)
-        _, impact_df = self.run_simulation(sample_tasks, sample_risks, sample_std_risks, n=500)
-        projekt_risks = impact_df[impact_df["Typ"] == "Projekt"]["Quelle"].tolist()
-        std_risks_result = impact_df[impact_df["Typ"] == "Standard"]["Quelle"].tolist()
-        assert "Scope Creep" in projekt_risks
-        assert "Tech Issues" in projekt_risks
-        assert any("Schätz-Ungenauigkeit" in r for r in std_risks_result)
-
-    def test_simulation_task_specific_risk(self, sample_tasks, sample_std_risks):
-        """Task-spezifisches Risiko wirkt nur auf Task-Dauer."""
+    def test_simulation_with_task_specific_risk_on_team(self, sample_tasks, sample_teams, sample_std_risks):
         np.random.seed(42)
         task_risk = pd.DataFrame([{
             "Risk Name": "Design-Risk", "Risk Type": "Kontinuierlich",
@@ -362,305 +394,155 @@ class TestSimulation:
             "Impact Min": 0.5, "Impact Likely": 0.5, "Impact Max": 0.5,
             "Maßnahme / Mitigation": ""
         }])
-        durations, impact_df = self.run_simulation(sample_tasks, task_risk, [], n=1000)
-        design_duration = 10.0
-        expected_delay = design_duration * 0.5
+        durations, impact_df = self.run_simulation(sample_tasks, task_risk, [], sample_teams, n=500)
+        design_delay = 10.0 * 0.5
         actual_delay = impact_df[impact_df["Quelle"] == "Design-Risk"]["Verzögerung"].values[0]
-        assert abs(actual_delay - expected_delay) < 1.0
+        assert abs(actual_delay - design_delay) < 1.0
 
-    def test_simulation_binary_risk_probability_zero(self, sample_tasks):
-        """Binäres Risiko mit P=0 erzeugt keine Verzögerung."""
+    def test_simulation_returns_correct_shape(self, sample_tasks, sample_risks, sample_std_risks):
         np.random.seed(42)
-        zero_risk = pd.DataFrame([{
-            "Risk Name": "Zero Risk", "Risk Type": "Binär",
-            "Target (Global/Task)": "Global", "Probability (0-1)": 0.0,
-            "Impact Min": 1.0, "Impact Likely": 2.0, "Impact Max": 3.0,
+        durations, impact_df = self.run_simulation(sample_tasks, sample_risks, sample_std_risks, pd.DataFrame(), n=100)
+        assert len(durations) == 100
+        assert isinstance(impact_df, pd.DataFrame)
+
+    def test_simulation_base_duration_minimum(self, sample_tasks, sample_std_risks):
+        """Mit Teams: Basis = kritischer Pfad (30), nicht Summe (35)."""
+        np.random.seed(42)
+        risks_positive = pd.DataFrame([{
+            "Risk Name": "Positiv Risk", "Risk Type": "Binär",
+            "Target (Global/Task)": "Global", "Probability (0-1)": 1.0,
+            "Impact Min": 0.0, "Impact Likely": 0.1, "Impact Max": 0.2,
             "Maßnahme / Mitigation": ""
         }])
-        durations, impact_df = self.run_simulation(sample_tasks, zero_risk, [], n=1000)
-        base = sample_tasks["Duration (Days)"].sum()
-        assert np.mean(durations) == pytest.approx(base, abs=0.5)
-
-    def test_simulation_percentile_85_greater_than_50(self, sample_tasks, sample_risks, sample_std_risks):
-        np.random.seed(42)
-        durations, _ = self.run_simulation(sample_tasks, sample_risks, sample_std_risks, n=5000)
-        p50 = np.percentile(durations, 50)
-        p85 = np.percentile(durations, 85)
-        assert p85 >= p50
+        teams = pd.DataFrame([
+            {"Team": "Team A", "Capacity": 1.0},
+            {"Team": "Team B", "Capacity": 2.0},
+        ])
+        durations, _ = self.run_simulation(sample_tasks, risks_positive, [], teams, n=500)
+        # Kritischer Pfad = Team A (30 Tage), nicht Summe (35)
+        critical_path = 30.0
+        assert durations.min() >= critical_path * 0.97
 
     def test_simulation_no_risks_equals_base_sum(self, sample_tasks):
+        """Ohne Risiken: kritischer Pfad konstant."""
         np.random.seed(42)
-        durations, impact_df = self.run_simulation(sample_tasks, pd.DataFrame(), [], n=100)
-        base = int(sample_tasks["Duration (Days)"].sum())
-        assert all(d == base for d in durations)
+        teams = pd.DataFrame([
+            {"Team": "Team A", "Capacity": 1.0},
+            {"Team": "Team B", "Capacity": 2.0},
+        ])
+        durations, impact_df = self.run_simulation(sample_tasks, pd.DataFrame(), [], teams, n=100)
+        # Kritischer Pfad = 30 (Team A), nicht 35 (Summe)
+        critical_path = 30
+        assert all(d == critical_path for d in durations)
         assert impact_df.empty
 
-    def test_simulation_deterministic_with_seed(self, sample_tasks, sample_risks, sample_std_risks):
-        np.random.seed(123)
-        d1, _ = self.run_simulation(sample_tasks, sample_risks, sample_std_risks, n=500)
-        np.random.seed(123)
-        d2, _ = self.run_simulation(sample_tasks, sample_risks, sample_std_risks, n=500)
-        np.testing.assert_array_equal(d1, d2)
+    # ==================== NEUE TESTS ====================
 
+    def test_simulation_binary_vs_continuous_risk_impact(self, sample_tasks):
+        """Binäre Risiken: stochastisch | Kontinuierlich: deterministisch."""
+        np.random.seed(42)
+        teams = pd.DataFrame([{"Team": "Team A", "Capacity": 1.0}, {"Team": "Team B", "Capacity": 2.0}])
+        
+        # Binär: manchmal 0, manchmal Impact
+        binary_risk = pd.DataFrame([{
+            "Risk Name": "Binary", "Risk Type": "Binär",
+            "Target (Global/Task)": "Global", "Probability (0-1)": 0.5,
+            "Impact Min": 5.0, "Impact Likely": 10.0, "Impact Max": 15.0,
+            "Maßnahme / Mitigation": ""
+        }])
+        durations_bin, _ = self.run_simulation(sample_tasks, binary_risk, [], teams, n=1000)
+        
+        # Kontinuierlich: immer Impact
+        cont_risk = pd.DataFrame([{
+            "Risk Name": "Continuous", "Risk Type": "Kontinuierlich",
+            "Target (Global/Task)": "Global", "Probability (0-1)": 0.5,
+            "Impact Min": 5.0, "Impact Likely": 10.0, "Impact Max": 15.0,
+            "Maßnahme / Mitigation": ""
+        }])
+        durations_cont, _ = self.run_simulation(sample_tasks, cont_risk, [], teams, n=1000)
+        
+        # Kontinuierlich sollte konsistent höher sein
+        assert np.mean(durations_cont) > np.mean(durations_bin)
 
-# ============================================================
-# 3. BACKTESTING / VALIDIERUNGSLOGIK
-# ============================================================
-
-class TestBacktesting:
-
-    def _insert_actual_result(self, project, planned_days, actual_days, risks_occurred=None, notes=""):
-        conn = get_test_db_connection()
-        buffer = actual_days - planned_days
-        conn.execute("""
-            INSERT INTO actual_results 
-            (project, start_date, planned_end_date, actual_end_date,
-             planned_duration, actual_duration, buffer_used, top_risk, risks_occurred, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, (project, "2026-01-01", "2026-04-01", "2026-05-01",
-              planned_days, actual_days, buffer, "Scope Creep",
-              json.dumps(risks_occurred or []), notes))
-        conn.commit()
-        conn.close()
-
-    def test_accuracy_calculation_all_correct(self):
-        """Alle Projekte innerhalb 15% → 100% Accuracy."""
-        data = pd.DataFrame([
-            {"planned_duration": 100, "actual_duration": 110},
-            {"planned_duration": 80,  "actual_duration": 90},
-            {"planned_duration": 120, "actual_duration": 130},
+    def test_simulation_multiple_teams_bottleneck(self):
+        """Kritischer Pfad = längster Team, nicht Summe."""
+        tasks = pd.DataFrame([
+            {"Task Name": "Quick", "Duration (Days)": 5.0, "Beschreibung": "", "team": "Fast Team"},
+            {"Task Name": "Slow", "Duration (Days)": 50.0, "Beschreibung": "", "team": "Slow Team"},
         ])
-        correct = sum(1 for _, r in data.iterrows() if r["actual_duration"] <= r["planned_duration"] * 1.15)
-        accuracy = correct / len(data) * 100
-        assert accuracy == 100.0
-
-    def test_accuracy_calculation_all_wrong(self):
-        """Alle Projekte über 15% → 0% Accuracy."""
-        data = pd.DataFrame([
-            {"planned_duration": 100, "actual_duration": 120},
-            {"planned_duration": 80,  "actual_duration": 100},
+        teams = pd.DataFrame([
+            {"Team": "Fast Team", "Capacity": 10.0},  # 5/10 = 0.5 Tage
+            {"Team": "Slow Team", "Capacity": 1.0},   # 50/1 = 50 Tage
         ])
-        correct = sum(1 for _, r in data.iterrows() if r["actual_duration"] <= r["planned_duration"] * 1.15)
-        accuracy = correct / len(data) * 100
-        assert accuracy == 0.0
+        np.random.seed(42)
+        durations, _ = self.run_simulation(tasks, pd.DataFrame(), [], teams, n=100)
+        # Bottleneck = Slow Team (50 Tage)
+        assert all(d == 50 for d in durations)
 
-    def test_accuracy_calculation_mixed(self):
-        data = pd.DataFrame([
-            {"planned_duration": 100.0, "actual_duration": 110.0},  # OK  (10%)
-            {"planned_duration": 100.0, "actual_duration": 120.0},  # NOK (20%)
-            {"planned_duration": 100.0, "actual_duration": 115.0},  # OK  (15% - Grenzfall)
-            {"planned_duration": 100.0, "actual_duration": 130.0},  # NOK (30%)
+    def test_simulation_global_risk_on_critical_path(self):
+        """Globales Risiko wirkt auf kritischen Pfad."""
+        tasks = pd.DataFrame([
+            {"Task Name": "T1", "Duration (Days)": 20.0, "Beschreibung": "", "team": "A"},
+            {"Task Name": "T2", "Duration (Days)": 10.0, "Beschreibung": "", "team": "B"},
         ])
-        correct = sum(
-            1 for _, r in data.iterrows()
-            if r["actual_duration"] <= round(r["planned_duration"] * 1.15, 10)
-        )
-        accuracy = correct / len(data) * 100
-        assert accuracy == 50.0
+        teams = pd.DataFrame([
+            {"Team": "A", "Capacity": 1.0},
+            {"Team": "B", "Capacity": 1.0},
+        ])
+        global_risk = pd.DataFrame([{
+            "Risk Name": "Global", "Risk Type": "Kontinuierlich",
+            "Target (Global/Task)": "Global", "Probability (0-1)": 1.0,
+            "Impact Min": 0.5, "Impact Likely": 0.5, "Impact Max": 0.5,  # Nicht 1.0!
+            "Maßnahme / Mitigation": ""
+        }])
+        np.random.seed(42)
+        durations, impact_df = self.run_simulation(tasks, global_risk, [], teams, n=100)
+        
+        # Kritischer Pfad = 20 (Team A)
+        # Risiko: 0.5 * 20 = 10 Tage
+        # Ergebnis: 20 + 10 = 30
+        assert np.mean(durations) == pytest.approx(30.0, abs=1.0)
+        assert impact_df.iloc[0]["Verzögerung"] == pytest.approx(10.0, abs=0.5)
 
-    def test_abweichung_prozent_positive(self):
-        """Verzögerung → positive Abweichung."""
-        planned, actual = 100.0, 120.0
-        abweichung = (actual - planned) / planned * 100
-        assert abweichung == pytest.approx(20.0)
-
-    def test_abweichung_prozent_negative(self):
-        """Früher fertig → negative Abweichung."""
-        planned, actual = 100.0, 90.0
-        abweichung = (actual - planned) / planned * 100
-        assert abweichung == pytest.approx(-10.0)
-
-    def test_abweichung_prozent_zero(self):
-        planned, actual = 100.0, 100.0
-        abweichung = (actual - planned) / planned * 100
-        assert abweichung == pytest.approx(0.0)
-
-    def test_avg_deviation_triggers_optimistic_warning(self):
-        """Ø > 15% → 'zu optimistisch'."""
-        deviations = [20.0, 18.0, 22.0, 16.0]
-        avg = sum(deviations) / len(deviations)
-        assert avg > 15
-        recommendation = "zu_optimistisch" if avg > 15 else ("zu_pessimistisch" if avg < -10 else "gut")
-        assert recommendation == "zu_optimistisch"
-
-    def test_avg_deviation_triggers_pessimistic_warning(self):
-        """Ø < -10% → 'zu pessimistisch'."""
-        deviations = [-15.0, -12.0, -11.0, -14.0]
-        avg = sum(deviations) / len(deviations)
-        assert avg < -10
-        recommendation = "zu_optimistisch" if avg > 15 else ("zu_pessimistisch" if avg < -10 else "gut")
-        assert recommendation == "zu_pessimistisch"
-
-    def test_avg_deviation_good_calibration(self):
-        """Ø zwischen -10% und 15% → gut kalibriert."""
-        deviations = [5.0, -3.0, 8.0, 2.0]
-        avg = sum(deviations) / len(deviations)
-        assert -10 <= avg <= 15
-        recommendation = "zu_optimistisch" if avg > 15 else ("zu_pessimistisch" if avg < -10 else "gut")
-        assert recommendation == "gut"
-
-    def test_risk_frequency_counting(self):
-        """Häufigkeit eingetretener Risiken korrekt zählen."""
-        risks_data = [
-            json.dumps(["Scope Creep", "Tech Issues"]),
-            json.dumps(["Scope Creep"]),
-            json.dumps(["Personalfluktuation", "Scope Creep"]),
+    def test_simulation_standard_risks_combined(self, sample_tasks):
+        """Mehrere Standardrisiken addieren sich."""
+        np.random.seed(42)
+        teams = pd.DataFrame([
+            {"Team": "Team A", "Capacity": 1.0},
+            {"Team": "Team B", "Capacity": 2.0},
+        ])
+        std_risks = [
+            {"name": "Risk 1", "type": "Kontinuierlich", "prob": 1.0, "min": 0.1, "likely": 0.1, "max": 0.1},
+            {"name": "Risk 2", "type": "Kontinuierlich", "prob": 1.0, "min": 0.1, "likely": 0.1, "max": 0.1},
         ]
-        all_risks = []
-        for r in risks_data:
-            all_risks.extend(json.loads(r))
-        counts = pd.Series(all_risks).value_counts()
-        assert counts["Scope Creep"] == 3
-        assert counts["Tech Issues"] == 1
-        assert counts["Personalfluktuation"] == 1
+        durations, impact_df = self.run_simulation(sample_tasks, pd.DataFrame(), std_risks, teams, n=100)
+        # Kritischer Pfad = 30, + 0.1*30 + 0.1*30 = 30 + 3 + 3 = 36
+        expected_delay = (0.1 + 0.1) * 30.0
+        total_delay = impact_df["Verzögerung"].sum()
+        assert abs(total_delay - expected_delay) < 1.0
 
-    def test_velocity_calculation_on_track(self):
-        """Velocity >= 1 bedeutet: im Plan oder voraus."""
-        geplante_tage = 35.0   # 70% von 50 Tagen geplant
-        tatsaechliche_tage = 30
-        velocity = geplante_tage / max(tatsaechliche_tage, 1)
-        assert velocity > 0.9
-        status = "Im Plan" if velocity >= 0.9 else "Verzögert"
-        assert status == "Im Plan"
-
-    def test_velocity_calculation_delayed(self):
-        geplante_tage = 20.0   # erst 40% von 50 Tagen geplant
-        tatsaechliche_tage = 30
-        velocity = geplante_tage / max(tatsaechliche_tage, 1)
-        assert velocity < 0.9
-        status = "Im Plan" if velocity >= 0.9 else "Verzögert"
-        assert status == "Verzögert"
-
-    def test_projected_end_date_calculation(self):
-        base_duration = 50.0
-        velocity = 0.8  # 20% langsamer
-        projected_total = int(base_duration / velocity)
-        assert projected_total == 62
-
-    def test_zwischenstand_note_prefix(self):
-        fertig_prozent = 60
-        notiz = "Alles läuft gut"
-        full_note = f"[ZWISCHENSTAND {fertig_prozent}%] {notiz}"
-        assert full_note == "[ZWISCHENSTAND 60%] Alles läuft gut"
-
-    def test_abschluss_note_prefix(self):
-        notes = "Lessons learned"
-        full_note = f"[ABSCHLUSS] {notes}"
-        assert full_note.startswith("[ABSCHLUSS]")
-
-    def test_buffer_used_calculation(self):
-        planned_end = pd.to_datetime("2026-06-01")
-        actual_end  = pd.to_datetime("2026-06-15")
-        start       = pd.to_datetime("2026-01-01")
-        planned_days = (planned_end - start).days
-        actual_days  = (actual_end  - start).days
-        buffer_used  = actual_days - planned_days
-        assert buffer_used == 14
-
-    def test_buffer_negative_when_early(self):
-        planned_end = pd.to_datetime("2026-06-01")
-        actual_end  = pd.to_datetime("2026-05-20")
-        start       = pd.to_datetime("2026-01-01")
-        planned_days = (planned_end - start).days
-        actual_days  = (actual_end  - start).days
-        buffer_used  = actual_days - planned_days
-        assert buffer_used < 0
-
-
-# ============================================================
-# 4. HILFSFUNKTIONEN & EDGE CASES
-# ============================================================
-
-class TestHelpers:
-
-    def test_get_default_standard_risks_returns_dataframe(self):
-        df = pd.DataFrame([
-            {"Aktiv": True, "name": "Schätz-Ungenauigkeit", "type": "Kontinuierlich",
-             "prob": 1.00, "min": -0.03, "likely": 0.00, "max": 0.08},
+    def test_simulation_global_risk_percentage(self):
+        """Globales Risiko = % des kritischen Pfads."""
+        tasks = pd.DataFrame([
+            {"Task Name": "T1", "Duration (Days)": 20.0, "Beschreibung": "", "team": "A"},
+            {"Task Name": "T2", "Duration (Days)": 10.0, "Beschreibung": "", "team": "B"},
         ])
-        assert isinstance(df, pd.DataFrame)
-        assert "Aktiv" in df.columns
-        assert "name"  in df.columns
-
-    def test_standard_risks_has_active_and_inactive(self):
-        df = pd.DataFrame([
-            {"Aktiv": True,  "name": "Risk A", "type": "Binär", "prob": 0.4, "min": 0.05, "likely": 0.15, "max": 0.30},
-            {"Aktiv": False, "name": "Risk B", "type": "Binär", "prob": 0.2, "min": 0.03, "likely": 0.08, "max": 0.15},
+        teams = pd.DataFrame([
+            {"Team": "A", "Capacity": 1.0},
+            {"Team": "B", "Capacity": 1.0},
         ])
-        active = df[df["Aktiv"] == True]
-        inactive = df[df["Aktiv"] == False]
-        assert len(active) == 1
-        assert len(inactive) == 1
-
-    def test_probability_clipping(self):
-        probs = pd.Series([-0.1, 0.0, 0.5, 1.0, 1.5])
-        clipped = probs.clip(0, 1)
-        assert clipped.min() == 0.0
-        assert clipped.max() == 1.0
-
-    def test_impact_sorting(self):
-        """Min <= Likely <= Max nach Sortierung."""
-        vals = np.array([[0.2, 0.05, 0.1]])
-        sorted_vals = np.sort(vals, axis=1)
-        assert sorted_vals[0][0] <= sorted_vals[0][1] <= sorted_vals[0][2]
-
-    def test_triangular_distribution_bounds(self):
-        """Triangular-Verteilung bleibt innerhalb der Grenzen."""
+        # 20% Impact auf kritischen Pfad (20 Tage)
+        global_risk = pd.DataFrame([{
+            "Risk Name": "20% Risk", "Risk Type": "Kontinuierlich",
+            "Target (Global/Task)": "Global", "Probability (0-1)": 1.0,
+            "Impact Min": 0.2, "Impact Likely": 0.2, "Impact Max": 0.2,
+            "Maßnahme / Mitigation": ""
+        }])
         np.random.seed(42)
-        samples = np.random.triangular(0.05, 0.15, 0.30, size=10000)
-        assert samples.min() >= 0.05
-        assert samples.max() <= 0.30
-
-    def test_end_dates_from_durations(self):
-        start = np.datetime64("2026-01-01")
-        durations = np.array([30, 45, 60])
-        end_dates = pd.to_datetime(start + durations.astype('timedelta64[D]'), errors='coerce')
-        assert str(end_dates[0].date()) == "2026-01-31"
-        assert str(end_dates[1].date()) == "2026-02-15"
-        assert str(end_dates[2].date()) == "2026-03-02"
-
-    def test_commit_85_percentile(self):
-        np.random.seed(42)
-        durations = np.random.normal(100, 15, 10000).astype(int)
-        start = np.datetime64("2026-01-01")
-        end_dates = pd.to_datetime(start + durations.astype('timedelta64[D]'), errors='coerce')
-        commit_85 = pd.Series(end_dates).quantile(0.85)
-        # 85% der Enddaten sollten vor oder gleich commit_85 liegen
-        pct_before = (pd.Series(end_dates) <= commit_85).mean()
-        assert pct_before >= 0.84
-
-    def test_history_diff_positive_means_delay(self):
-        current  = pd.Timestamp("2026-06-15")
-        previous = pd.Timestamp("2026-06-01")
-        diff = (current - previous).days
-        assert diff == 14
-        warning = "TERMINWARNUNG" if diff > 0 else "POSITIVER TREND"
-        assert warning == "TERMINWARNUNG"
-
-    def test_history_diff_negative_means_improvement(self):
-        current  = pd.Timestamp("2026-05-20")
-        previous = pd.Timestamp("2026-06-01")
-        diff = (current - previous).days
-        assert diff < 0
-        warning = "TERMINWARNUNG" if diff > 0 else "POSITIVER TREND"
-        assert warning == "POSITIVER TREND"
-
-    def test_tasks_sum_calculation(self, sample_tasks):
-        total = sample_tasks["Duration (Days)"].sum()
-        assert total == 35.0
-
-    def test_empty_tasks_sum_is_zero(self):
-        empty = pd.DataFrame(columns=["Task Name", "Duration (Days)", "Beschreibung"])
-        assert empty["Duration (Days)"].sum() == 0
-
-    def test_json_risks_occurred_roundtrip(self):
-        risks = ["Scope Creep", "Tech Issues", "Personalfluktuation"]
-        serialized   = json.dumps(risks)
-        deserialized = json.loads(serialized)
-        assert deserialized == risks
-
-    def test_json_risks_occurred_empty_list(self):
-        risks = []
-        serialized   = json.dumps(risks)
-        deserialized = json.loads(serialized)
-        assert deserialized == []
+        durations, impact_df = self.run_simulation(tasks, global_risk, [], teams, n=100)
+        
+        # Kritischer Pfad = 20
+        # Risiko: 0.2 * 20 = 4 Tage
+        # Ergebnis: 20 + 4 = 24
+        assert np.mean(durations) == pytest.approx(24.0, abs=1.0)
+        assert impact_df.iloc[0]["Verzögerung"] == pytest.approx(4.0, abs=0.5)

@@ -6,6 +6,7 @@ import json
 import traceback
 from datetime import datetime
 import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 
 # --- 1. SETUP & CONFIG ---
 APP_VERSION = "2.5.0"  # Updated mit Backtesting-Funktionen
@@ -30,7 +31,7 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
-    conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, task_name TEXT, duration REAL, description TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, task_name TEXT, duration REAL, description TEXT, team TEXT, sequence INTEGER)")
     conn.execute("CREATE TABLE IF NOT EXISTS risks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, risk_name TEXT, risk_type TEXT, target TEXT, prob REAL, impact_min REAL, impact_likely REAL, impact_max REAL, mitigation TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, timestamp TEXT, target_date TEXT, buffer REAL, top_risk TEXT)")
     conn.execute("""
@@ -48,12 +49,22 @@ def init_db():
             notes TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT,
+            team_name TEXT,
+            capacity REAL DEFAULT 1.0
+        )
+    """)
     conn.commit()
     conn.close()
 
 init_db()
 
 # --- 4. HILFSFUNKTIONEN ---
+
+# ===== NORMALE HILFSFUNKTIONEN =====
 def get_all_projects():
     conn = get_db_connection()
     df = pd.read_sql("SELECT DISTINCT project FROM tasks UNION SELECT DISTINCT project FROM risks", conn)
@@ -62,6 +73,7 @@ def get_all_projects():
     return projs if projs else ["Demo_Projekt"]
 
 def load_tasks(project):
+    """Lade alle Tasks für ein Projekt."""
     conn = get_db_connection()
     df = pd.read_sql("SELECT task_name as 'Task Name', duration as 'Duration (Days)', description as 'Beschreibung' FROM tasks WHERE project=?", conn, params=(project,))
     conn.close()
@@ -70,12 +82,14 @@ def load_tasks(project):
     return df.reset_index(drop=True)
 
 def load_risks(project):
+    """Lade alle Risiken für ein Projekt."""
     conn = get_db_connection()
     df = pd.read_sql("SELECT risk_name as 'Risk Name', risk_type as 'Risk Type', target as 'Target (Global/Task)', prob as 'Probability (0-1)', impact_min as 'Impact Min', impact_likely as 'Impact Likely', impact_max as 'Impact Max', mitigation as 'Maßnahme / Mitigation' FROM risks WHERE project=?", conn, params=(project,))
     conn.close()
     return df.reset_index(drop=True)
 
 def save_data(project, df_tasks, df_risks):
+    """Speichere Tasks und Risiken für ein Projekt."""
     conn = get_db_connection()
     conn.execute("DELETE FROM tasks WHERE project=?", (project,))
     conn.execute("DELETE FROM risks WHERE project=?", (project,))
@@ -108,6 +122,7 @@ def save_data(project, df_tasks, df_risks):
     conn.close()
 
 def save_history(project, target_date, buffer, top_risk):
+    """Speichere die Mess-Historie."""
     conn = get_db_connection()
     conn.execute("INSERT INTO history (project, timestamp, target_date, buffer, top_risk) VALUES (?,?,?,?,?)",
                  (project, datetime.now().strftime('%Y-%m-%d %H:%M'), target_date, buffer, top_risk))
@@ -115,6 +130,7 @@ def save_history(project, target_date, buffer, top_risk):
     conn.close()
 
 def delete_history_only(project):
+    """Lösche die Mess-Historie für ein Projekt."""
     conn = get_db_connection()
     conn.execute("DELETE FROM history WHERE project=?", (project,))
     conn.commit()
@@ -188,15 +204,128 @@ def get_default_standard_risks_df():
         {"Aktiv": False, "name": "Security-/Compliance-Auflagen", "type": "Binär",          "prob": 0.15, "min":  0.03, "likely": 0.09, "max": 0.20},
     ])
 
+def load_teams(project):
+    """Lade alle Teams für ein Projekt."""
+    conn = get_db_connection()
+    df = pd.read_sql(
+        "SELECT team_name as 'Team', capacity as 'Capacity' FROM teams WHERE project=? ORDER BY team_name",
+        conn, params=(project,)
+    )
+    conn.close()
+    if df.empty:
+        df = pd.DataFrame([{"Team": "Standard", "Capacity": 1.0}])
+    return df.reset_index(drop=True)
+
+def save_teams(project, df_teams):
+    """Speichere Teams für ein Projekt."""
+    conn = get_db_connection()
+    conn.execute("DELETE FROM teams WHERE project=?", (project,))
+    for _, row in df_teams.iterrows():
+        team_name = str(row.get("Team", "")).strip()
+        if team_name:
+            try:
+                capacity = float(row.get("Capacity", 1.0))
+                if capacity > 0:
+                    conn.execute("INSERT INTO teams (project, team_name, capacity) VALUES (?,?,?)",
+                                 (project, team_name, capacity))
+            except (ValueError, TypeError):
+                pass
+    conn.commit()
+    conn.close()
+
+def calculate_critical_path(tasks_df):
+    """Berechne den kritischen Pfad (längste Sequenz pro Team)."""
+    if tasks_df.empty or "Duration (Days)" not in tasks_df.columns:
+        return 0.0
+    
+    if "team" not in tasks_df.columns:
+        return float(tasks_df["Duration (Days)"].sum())
+    
+    # Gruppiere nach Team und summiere Dauern
+    team_durations = tasks_df.groupby("team")["Duration (Days)"].sum()
+    return float(team_durations.max()) if not team_durations.empty else 0.0
+
+# ===== WERKTAGE-FUNKTIONEN =====
+def add_business_days(start_date, num_days):
+    """Addiere Werktage (Mo-Fr) zu einem Datum."""
+    current = pd.to_datetime(start_date)
+    days_added = 0
+    
+    while days_added < num_days:
+        current += pd.Timedelta(days=1)
+        # 0=Mo, 1=Di, ..., 4=Fr, 5=Sa, 6=So
+        if current.weekday() < 5:  # Montag bis Freitag
+            days_added += 1
+    
+    return current
+
+# Deutsche Feiertage 2024-2026 (hardcoded)
+GERMAN_HOLIDAYS = [
+    "2024-01-01", "2024-03-29", "2024-03-30", "2024-04-01", "2024-05-01",
+    "2024-05-09", "2024-05-19", "2024-05-30", "2024-10-03", "2024-12-25", "2024-12-26",
+    "2025-01-01", "2025-04-18", "2025-04-19", "2025-04-21", "2025-05-01",
+    "2025-05-08", "2025-05-29", "2025-06-09", "2025-10-03", "2025-12-25", "2025-12-26",
+    "2026-01-01", "2026-04-10", "2026-04-11", "2026-04-13", "2026-05-01",
+    "2026-05-21", "2026-05-31", "2026-06-11", "2026-10-03", "2026-12-25", "2026-12-26",
+]
+
+def add_business_days_with_holidays(start_date, num_days):
+    """Addiere Werktage (Mo-Fr, ohne deutsche Feiertage)."""
+    current = pd.to_datetime(start_date)
+    days_added = 0
+    holiday_set = set(pd.to_datetime(GERMAN_HOLIDAYS).strftime('%Y-%m-%d'))
+    
+    while days_added < num_days:
+        current += pd.Timedelta(days=1)
+        date_str = current.strftime('%Y-%m-%d')
+        # Werktag UND kein Feiertag
+        if current.weekday() < 5 and date_str not in holiday_set:
+            days_added += 1
+    
+    return current
+
+def convert_calendar_to_business_days(calendar_days):
+    """Konvertiere Kalendertage zu Werktagen (grobe Schätzung)."""
+    # Annahme: 5 Arbeitstage pro 7 Kalendertage
+    return calendar_days * (5.0 / 7.0)
+
 # --- 5. SIMULATION ---
-def run_fast_simulation(tasks, risks, std_risks, n):
+def run_fast_simulation(tasks, risks, std_risks, teams, n):
+    """
+    Monte-Carlo Simulation mit Team-Parallelisierung.
+    - Tasks innerhalb eines Teams: SEQUENZIELL
+    - Verschiedene Teams: PARALLEL
+    """
     if tasks.empty or tasks["Duration (Days)"].sum() <= 0:
         raise ValueError("Keine gültigen Tasks definiert oder alle Dauern = 0")
 
-    base_sum = float(tasks["Duration (Days)"].sum())
+    # Fülle fehlende Team-Spalte
+    tasks_copy = tasks.copy()
+    if "team" not in tasks_copy.columns:
+        tasks_copy["team"] = "Sequenziell"
+    
+    # Berechne Basis-Dauer: kritischer Pfad (längste Team-Sequenz)
+    team_durations = {}
+    for team_name in tasks_copy["team"].unique():
+        team_tasks = tasks_copy[tasks_copy["team"] == team_name]
+        team_sum = team_tasks["Duration (Days)"].sum()
+        
+        # Wende Team-Capacity an
+        if not teams.empty:
+            team_row = teams[teams["Team"] == team_name]
+            if not team_row.empty:
+                capacity = float(team_row.iloc[0].get("Capacity", 1.0))
+                team_sum = team_sum / capacity  # Höhere Capacity = schneller
+        
+        team_durations[team_name] = team_sum
+    
+    # Kritischer Pfad = längste Dauer aller Teams
+    base_sum = max(team_durations.values()) if team_durations else tasks_copy["Duration (Days)"].sum()
+    
     total_days = np.full(n, base_sum, dtype=float)
     impact_results = []
 
+    # --- PROZESS-RISIKEN (wirken auf Tasks) ---
     for _, r in risks.iterrows():
         p = float(r.get("Probability (0-1)", 0))
         rtype = str(r.get("Risk Type", "Binär")).strip().lower()
@@ -204,35 +333,64 @@ def run_fast_simulation(tasks, risks, std_risks, n):
         mins = float(r.get("Impact Min", 0))
         lik = float(r.get("Impact Likely", mins))
         maxv = float(r.get("Impact Max", lik))
+        
         impacts = np.random.triangular(mins, lik, max(maxv, lik + 1e-6), size=n)
         hits = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
 
+        # Bestimme betroffene Dauer
         if target.lower() == "global":
+            # Global = wirkt auf kritischen Pfad
             relevant_dur = base_sum
         else:
-            match = tasks[tasks["Task Name"] == target]
-            relevant_dur = float(match["Duration (Days)"].sum()) if not match.empty else 0.0
+            # Task-spezifisch = wirkt nur auf diese Task
+            match = tasks_copy[tasks_copy["Task Name"] == target]
+            if not match.empty:
+                relevant_dur = float(match["Duration (Days)"].iloc[0])
+                # Wenn Task in schnellerem Team: Risiko-Dauer auch proportional schneller
+                task_team = match.iloc[0].get("team", "Sequenziell")
+                if not teams.empty:
+                    team_row = teams[teams["Team"] == task_team]
+                    if not team_row.empty:
+                        capacity = float(team_row.iloc[0].get("Capacity", 1.0))
+                        relevant_dur = relevant_dur / capacity
+            else:
+                relevant_dur = 0.0
 
         if relevant_dur <= 0:
             continue
 
+        # Addiere Risiko-Verzögerung zum kritischen Pfad
         delay = impacts * relevant_dur
         total_days += delay if rtype == "kontinuierlich" else (hits * delay)
+        
         avg_delay = float(delay.mean()) if rtype == "kontinuierlich" else float((hits * delay).mean())
-        impact_results.append({"Quelle": str(r["Risk Name"]), "Verzögerung": avg_delay, "Typ": "Projekt"})
+        impact_results.append({
+            "Quelle": str(r["Risk Name"]), 
+            "Verzögerung": avg_delay, 
+            "Typ": "Projekt",
+            "Team": task_team if target.lower() != "global" else "Global"
+        })
 
+    # --- STANDARD-RISIKEN ---
     for sr in std_risks:
         rtype = str(sr.get("type", "Binär")).strip().lower()
         p = float(sr.get("prob", 0))
         mins = float(sr.get("min", 0))
         lik = float(sr.get("likely", mins))
         maxv = float(sr.get("max", lik))
+        
         impacts = np.random.triangular(mins, lik, max(maxv, lik + 1e-6), size=n)
         hits = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
         delay = impacts * base_sum
         total_days += delay if rtype == "kontinuierlich" else (hits * delay)
+        
         avg_delay = float(delay.mean()) if rtype == "kontinuierlich" else float((hits * delay).mean())
-        impact_results.append({"Quelle": f"STD: {sr['name']}", "Verzögerung": avg_delay, "Typ": "Standard"})
+        impact_results.append({
+            "Quelle": f"STD: {sr['name']}", 
+            "Verzögerung": avg_delay, 
+            "Typ": "Standard",
+            "Team": "Global"
+        })
 
     total_days = np.clip(total_days, 0, 10000)
     return total_days.astype(int), pd.DataFrame(impact_results)
@@ -375,26 +533,159 @@ with st.sidebar:
     n_sim = st.number_input("Durchläufe", min_value=1000, max_value=50000, value=10000, step=1000)
     start_date = st.date_input("Projekt-Start", datetime.now())
 
+    # NEUE OPTION:
+    use_business_days = st.checkbox("📅 Werktage verwenden (Mo-Fr)", value=False, 
+                                 help="True = nur Montag-Freitag zählen\nFalse = alle Kalendertage")
+
 # --- 8. MAIN ---
 st.title(f"🎲 {selected_proj} | v{APP_VERSION}")
 st.info("📌 **Workflow:** 1️⃣ Tasks definieren & speichern → 2️⃣ Risiken konfigurieren → 3️⃣ Simulation starten")
 
+# --- TEAMS (Vereinfacht) ---
+st.divider()
+st.subheader("👥 Team-Verwaltung")
+
+col_tm1, col_tm2 = st.columns([2, 1])
+with col_tm1:
+    st.info("💡 **Wie Teams funktionieren:**\n"
+            "- Tasks werden Teams zugewiesen\n"
+            "- Teams arbeiten **parallel** zueinander\n"
+            "- Capacity: 1.0 = normal, 2.0 = doppelte Geschwindigkeit\n"
+            "- Projekt endet wenn **längster Team** fertig ist (nicht Summe!)")
+
+tm_curr = load_teams(selected_proj)
+with col_tm2:
+    st.metric("📊 Teams aktiv", len(tm_curr))
+
+# Teams mit besserer Visualisierung
+st.subheader("Team-Struktur")
+col_a, col_b, col_c = st.columns(3)
+
+with col_a:
+    st.write("**Team Name**")
+    team_names = st.data_editor(
+        tm_curr[["Team"]].reset_index(drop=True),
+        use_container_width=True,
+        num_rows="dynamic",
+        key=f"team_names_{selected_proj}",
+        hide_index=True
+    )
+
+with col_b:
+    st.write("**Kapazität**")
+    team_caps = st.data_editor(
+        tm_curr[["Capacity"]].reset_index(drop=True),
+        use_container_width=True,
+        num_rows="dynamic",
+        key=f"team_caps_{selected_proj}",
+        column_config={"Capacity": st.column_config.NumberColumn(
+            "Kapazität", min_value=0.1, max_value=5.0, step=0.1
+        )},
+        hide_index=True
+    )
+
+with col_c:
+    st.write("**Beispiele**")
+    st.markdown("""
+    - 0.5 = **Doppelt so langsam**
+    - 1.0 = **Normal**
+    - 2.0 = **Doppelt so schnell**
+    - 3.0 = **3x schneller**
+    """)
+
+# Merge & Save
+if not team_names.empty and not team_caps.empty:
+    ed_tm = pd.concat([
+        team_names.reset_index(drop=True),
+        team_caps.reset_index(drop=True)
+    ], axis=1)
+    
+    if st.button("💾 Teams speichern", use_container_width=True, key="save_teams"):
+        save_teams(selected_proj, ed_tm)
+        st.success("✅ Teams aktualisiert!")
+        st.rerun()
+else:
+    # Fallback wenn leer
+    ed_tm = tm_curr.copy()
+
+st.caption("💡 Capacity > 1.0 = schneller (z.B. 2.0 = doppeltes Tempo). Wird nicht verwendet, wenn leer.")
+
 # --- TASKS ---
 st.divider()
 st.subheader("📋 1. Projektstruktur (Tasks)")
+st.info("💡 **Parallel-Arbeit:** Ordne Tasks Teams zu. Tasks desselben Teams laufen sequenziell, Teams arbeiten parallel.")
+
 t_curr = load_tasks(selected_proj)
-ed_t = st.data_editor(
-    t_curr, use_container_width=True, num_rows="dynamic", key=f"t_{selected_proj}",
-    column_config={"Duration (Days)": st.column_config.NumberColumn("Dauer (Tage)", min_value=0.1, step=1.0)}
-)
-col_t1, _, col_t3 = st.columns([1, 1, 2])
+if "team" not in t_curr.columns:
+    t_curr.insert(len(t_curr.columns), "team", "Sequenziell")
+
+# Visuelle Vorschau
+st.write("**Aufgaben-Zuordnung**")
+tab_edit, tab_preview = st.tabs(["Bearbeiten", "Vorschau"])
+
+with tab_edit:
+    team_options = ["Sequenziell"] + ed_tm["Team"].tolist() if not ed_tm.empty else ["Sequenziell"]
+    
+    ed_t = st.data_editor(
+        t_curr,
+        use_container_width=True,
+        num_rows="dynamic",
+        key=f"t_{selected_proj}",
+        column_config={
+            "Duration (Days)": st.column_config.NumberColumn(
+                "Dauer (Tage)", min_value=0.1, step=1.0
+            ),
+            "team": st.column_config.SelectboxColumn(
+                "Team zugewiesen", 
+                options=team_options,
+                help="Wähle Team für Parallelverarbeitung"
+            )
+        }
+    )
+
+with tab_preview:
+    # Zeige kritischen Pfad Berechnung
+    st.write("**Kritischer Pfad Berechnung**")
+    
+    if not ed_t.empty and "team" in ed_t.columns:
+        team_breakdown = ed_t.groupby("team")["Duration (Days)"].sum().sort_values(ascending=False)
+        
+        for team, duration in team_breakdown.items():
+            # Capacity anwenden
+            capacity = 1.0
+            if not ed_tm.empty:
+                team_row = ed_tm[ed_tm["Team"] == team]
+                if not team_row.empty:
+                    capacity = float(team_row.iloc[0]["Capacity"])
+            
+            effective = duration / capacity
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.write(f"**{team}**")
+            col2.metric("Summe", f"{duration:.0f}d")
+            col3.metric("Kapazität", f"{capacity}x")
+            col4.metric("Effektiv", f"{effective:.1f}d", delta="CP" if effective == team_breakdown.max() / capacity else None)
+        
+        critical_path_calc = max([
+            (float(ed_t[ed_t["team"] == t]["Duration (Days)"].sum()) / 
+             (float(ed_tm[ed_tm["Team"] == t]["Capacity"].iloc[0]) if not ed_tm[ed_tm["Team"] == t].empty else 1.0))
+            for t in ed_t["team"].unique()
+        ])
+        
+        st.success(f"✅ **Kritischer Pfad = {critical_path_calc:.1f} Tage** (nicht {ed_t['Duration (Days)'].sum():.0f}!)")
+
+col_t1, col_t2 = st.columns([1, 1])
 with col_t1:
     if st.button("💾 Tasks speichern", use_container_width=True):
+        if "team" not in ed_t.columns:
+            ed_t["team"] = "Sequenziell"
+        ed_t["team"] = ed_t["team"].fillna("Sequenziell")
         save_data(selected_proj, ed_t, load_risks(selected_proj))
         st.success("✅ Tasks gespeichert!")
         st.rerun()
-with col_t3:
-    st.metric("Gesamt-Dauer", f"{ed_t['Duration (Days)'].sum():.1f} Tage")
+
+with col_t2:
+    st.info(f"📊 {len(ed_t)} Tasks | CP: {critical_path_calc:.0f}d")
 
 # --- RISKS ---
 st.divider()
@@ -427,9 +718,20 @@ if st.button("🚀 Simulation starten & Trend analysieren", use_container_width=
             st.stop()
 
         with st.spinner("⏳ Berechne Monte-Carlo Simulation..."):
-            durations, impact_df = run_fast_simulation(ed_t, ed_r, selected_std, n_sim)
-            start_np = np.datetime64(start_date)
-            end_dates = pd.to_datetime(start_np + durations.astype('timedelta64[D]'), errors='coerce')
+            # WICHTIG: ed_tm (Teams) mitübergeben!
+            durations, impact_df = run_fast_simulation(ed_t, ed_r, selected_std, ed_tm, n_sim)
+            
+            # --- WERKTAGE ODER KALENDERTAGE ---
+            if use_business_days:
+                # Mit Feiertagen
+                end_dates = pd.Series([
+                    add_business_days_with_holidays(start_date, int(d)) for d in durations
+                ])
+            else:
+                # Standard: Kalendertage
+                start_np = np.datetime64(start_date)
+                end_dates = pd.to_datetime(start_np + durations.astype('timedelta64[D]'), errors='coerce')
+            
             commit_85 = pd.Series(end_dates).quantile(0.85)
 
             st.session_state.last_durations   = durations
@@ -859,7 +1161,7 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
                     save_actual_result(
                         selected_proj,
                         str(actual_start),
-                        str(commit_85.date()) if st.session_state.last_commit_85 else str(actual_end_final),
+                        str(commit_85.date() if st.session_state.last_commit_85 else str(actual_end_final)),
                         str(actual_end_final),
                         str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
                         risks_that_occurred,
