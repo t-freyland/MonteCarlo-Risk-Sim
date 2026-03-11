@@ -5,4 +5,3 @@ sqlite3-python
 json
 plotly>=5.17.0
 matplotlib>=3.7.0
-datetime
