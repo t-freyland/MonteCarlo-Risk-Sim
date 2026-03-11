@@ -776,35 +776,96 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
                 "Mit echten Daten können Sie die Risiko-Parameter kontinuierlich verbessern!"
             )
 
-    # --- PROJEKT-ABSCHLUSS FORMULAR (innerhalb der Ergebnisanzeige) ---
+    # --- ALTES FORMULAR KOMPLETT LÖSCHEN ---
+    # Das folgende expander-Block ENTFERNEN:
+    # with st.expander("✅ Projekt-Abschluss dokumentieren", expanded=False):
+    #     ...
+
+    # --- NUR DIESES FORMULAR BEHALTEN ---
     st.divider()
-    with st.expander("✅ Projekt-Abschluss dokumentieren", expanded=False):
-        st.subheader("📋 Tatsächliche Ergebnisse eintragen")
+    with st.expander("✅ Projektverlauf dokumentieren", expanded=False):
         
-        actual_start = st.date_input("Tatsächliches Start-Datum", start_date, key="actual_start")
-        actual_end = st.date_input("Tatsächliches End-Datum", key="actual_end")
-        
-        all_risk_options = ed_r["Risk Name"].tolist() + [sr["name"] for sr in selected_std]
-        risks_that_occurred = st.multiselect(
-            "Welche Risiken sind tatsächlich eingetreten?",
-            options=all_risk_options if all_risk_options else ["Keine"],
-            key="risks_occurred"
+        erfassungs_modus = st.radio(
+            "Erfassungs-Typ:",
+            ["📅 Zwischenstand (laufend)", "🏁 Projektabschluss (final)"],
+            horizontal=True,
+            key="erfassungs_modus"
         )
-        
-        actual_notes = st.text_area("Notizen / Lessons Learned", key="actual_notes", height=100)
-        
-        if st.button("💾 Projektergebnis speichern", use_container_width=True, type="primary"):
-            try:
-                save_actual_result(
-                    selected_proj,
-                    str(actual_start),
-                    str(commit_85.date()) if st.session_state.last_commit_85 else str(actual_end),
-                    str(actual_end),
-                    str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
-                    risks_that_occurred,
-                    actual_notes
-                )
-                st.success("✅ Projektergebnis gespeichert! Ergebnisse in 'Validierung'-Tab sichtbar.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ Fehler beim Speichern: {str(e)}")
+
+        actual_start = st.date_input("Start-Datum", start_date, key="proj_actual_start")
+
+        if erfassungs_modus == "📅 Zwischenstand (laufend)":
+            st.subheader("📅 Laufender Zwischenstand")
+            col_zw1, col_zw2 = st.columns(2)
+            with col_zw1:
+                stand_datum = st.date_input("Stand-Datum (heute)", datetime.now(), key="stand_datum")
+            with col_zw2:
+                fertig_prozent = st.slider("Fertigstellungsgrad (%)", 0, 100, 50, key="fertig_prozent")
+
+            tatsaechliche_tage_bisher = (stand_datum - actual_start).days
+            geplante_tage_bisher = ed_t["Duration (Days)"].sum() * (fertig_prozent / 100)
+
+            col_info1, col_info2 = st.columns(2)
+            with col_info1:
+                st.metric("Tage bisher (tatsächlich)", tatsaechliche_tage_bisher)
+            with col_info2:
+                if geplante_tage_bisher > 0:
+                    velocity = geplante_tage_bisher / max(tatsaechliche_tage_bisher, 1)
+                    st.metric("Velocity (Plan/Actual)", f"{velocity:.2f}",
+                              delta="Im Plan" if velocity >= 0.9 else "Verzögert",
+                              delta_color="normal" if velocity >= 0.9 else "inverse")
+
+            risiken_jetzt = st.multiselect(
+                "Aktuell aktive / eingetretene Risiken:",
+                options=ed_r["Risk Name"].tolist() + [sr["name"] for sr in selected_std],
+                key="risiken_zwischenstand"
+            )
+            notiz_zwischen = st.text_area("Notiz zum Zwischenstand", key="notiz_zwischen", height=80)
+
+            if st.button("💾 Zwischenstand speichern", use_container_width=True):
+                try:
+                    if geplante_tage_bisher > 0 and velocity > 0:
+                        projected_total_days = int(ed_t["Duration (Days)"].sum() / velocity)
+                    else:
+                        projected_total_days = int(ed_t["Duration (Days)"].sum() * 2)
+                    projected_end = actual_start + pd.Timedelta(days=projected_total_days)
+                    save_actual_result(
+                        selected_proj,
+                        str(actual_start),
+                        str(commit_85.date()),
+                        str(projected_end.date()),
+                        str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
+                        risiken_jetzt,
+                        f"[ZWISCHENSTAND {fertig_prozent}%] {notiz_zwischen}"
+                    )
+                    st.success(f"✅ Zwischenstand gespeichert! Hochgerechnetes Ende: {projected_end.strftime('%d.%m.%Y')}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Fehler: {str(e)}")
+
+        else:
+            st.subheader("🏁 Projektabschluss")
+            actual_end_final = st.date_input("Tatsächliches End-Datum", key="actual_end_final")
+            all_risk_options = ed_r["Risk Name"].tolist() + [sr["name"] for sr in selected_std]
+            risks_that_occurred = st.multiselect(
+                "Eingetretene Risiken (gesamt):",
+                options=all_risk_options if all_risk_options else ["Keine"],
+                key="risks_occurred_final"
+            )
+            actual_notes = st.text_area("Lessons Learned", key="actual_notes_final", height=100)
+
+            if st.button("💾 Projektabschluss speichern", use_container_width=True, type="primary"):
+                try:
+                    save_actual_result(
+                        selected_proj,
+                        str(actual_start),
+                        str(commit_85.date()) if st.session_state.last_commit_85 else str(actual_end_final),
+                        str(actual_end_final),
+                        str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
+                        risks_that_occurred,
+                        f"[ABSCHLUSS] {actual_notes}"
+                    )
+                    st.success("✅ Projektabschluss gespeichert!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Fehler beim Speichern: {str(e)}")
