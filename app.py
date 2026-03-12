@@ -371,6 +371,14 @@ def add_business_days_vectorized(start_date, days_array):
 
     return pd.DatetimeIndex(results)
 
+# Backward-compatible helper for old call sites
+def add_business_days_with_holidays(start_date, num_days):
+    num_days = max(1, int(num_days))
+    return add_business_days_vectorized(
+        start_date,
+        np.array([num_days], dtype=int)
+    )[0]
+
 # --- 5. SIMULATION ---
 def run_fast_simulation(tasks, risks, std_risks, teams, n):
     if tasks.empty or tasks["Duration (Days)"].sum() <= 0:
@@ -1061,15 +1069,21 @@ if st.session_state.last_durations is not None:
 
         st.divider()
         st.write("**Percentiles:**")
-        pcts     = [50, 70, 80, 85, 90, 95]
-        pct_data = []
-        for pc in pcts:
-            d  = int(np.percentile(durations, pc))
-            ed = (add_business_days_with_holidays(start_date, d)
-                  if use_business_days
-                  else pd.to_datetime(np.datetime64(start_date) + np.timedelta64(d, 'D')))
-            pct_data.append({"Percentile": f"P{pc}", "Days": d,
-                             "End Date": ed.strftime('%d.%m.%Y')})
+        pcts = [50, 70, 80, 85, 90, 95]
+        pct_days = np.array([int(np.percentile(durations, pc)) for pc in pcts], dtype=int)
+
+        if use_business_days:
+            pct_end_dates = add_business_days_vectorized(start_date, pct_days)
+        else:
+            pct_end_dates = pd.to_datetime(
+                np.datetime64(start_date) + pct_days.astype("timedelta64[D]"),
+                errors="coerce"
+            )
+
+        pct_data = [
+            {"Percentile": f"P{pc}", "Days": int(d), "End Date": pd.Timestamp(ed).strftime("%d.%m.%Y")}
+            for pc, d, ed in zip(pcts, pct_days, pct_end_dates)
+        ]
         st.dataframe(pd.DataFrame(pct_data), use_container_width=True, hide_index=True)
 
         st.divider()
