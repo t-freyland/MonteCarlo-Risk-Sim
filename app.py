@@ -8,7 +8,7 @@ from datetime import datetime
 import plotly.graph_objects as go
 
 # --- 1. SETUP & CONFIG ---
-APP_VERSION = "2.5.0"  # Updated mit Backtesting-Funktionen
+APP_VERSION = "2.5.1"  # Updated mit Backtesting-Funktionen
 DB_FILE = "risk_management.db"
 
 st.set_page_config(page_title=f"Risk Sim Pro v{APP_VERSION}", layout="wide")
@@ -1168,16 +1168,27 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
                     else:
                         projected_total_days = int(ed_t["Duration (Days)"].sum() * 2)
                     projected_end = actual_start + pd.Timedelta(days=projected_total_days)
+
+                    # FIX: commit_85 kann date oder datetime sein
+                    c85 = st.session_state.last_commit_85
+                    planned_end_str = (
+                        c85.strftime('%Y-%m-%d')
+                        if c85 is not None and hasattr(c85, 'strftime')
+                        else str(projected_end.date()
+                                 if hasattr(projected_end, 'date')
+                                 else projected_end)
+                    )
+
                     save_actual_result(
                         selected_proj,
                         str(actual_start),
-                        str(commit_85.date()),
-                        str(projected_end.date()),
+                        planned_end_str,
+                        str(projected_end.date() if hasattr(projected_end, 'date') else projected_end),
                         str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
                         risiken_jetzt,
                         f"[ZWISCHENSTAND {fertig_prozent}%] {notiz_zwischen}"
                     )
-                    st.success(f"✅ Zwischenstand gespeichert! Hochgerechnetes Ende: {projected_end.strftime('%d.%m.%Y')}")
+                    st.success(f"✅ Zwischenstand gespeichert!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ Fehler: {str(e)}")
@@ -1195,10 +1206,18 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
 
             if st.button("💾 Projektabschluss speichern", use_container_width=True, type="primary"):
                 try:
+                    # FIX: commit_85 kann date oder datetime sein
+                    c85 = st.session_state.last_commit_85
+                    planned_end_str = (
+                        c85.strftime('%Y-%m-%d')
+                        if c85 is not None and hasattr(c85, 'strftime')
+                        else str(actual_end_final)
+                    )
+
                     save_actual_result(
                         selected_proj,
                         str(actual_start),
-                        str(commit_85.date() if st.session_state.last_commit_85 else str(actual_end_final)),
+                        planned_end_str,
                         str(actual_end_final),
                         str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
                         risks_that_occurred,
