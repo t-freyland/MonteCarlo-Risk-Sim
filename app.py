@@ -989,7 +989,7 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
             with col_acc1:
                 st.metric("✅ Vorhersage-Accuracy", f"{accuracy:.1f}%", 
                           delta="Gut" if accuracy > 75 else "Überprüfen", 
-                          delta_color="normal" if accuracy > 75 else "bad")
+                          delta_color="normal" if accuracy > 75 else "inverse")  # "bad" → "inverse"
             with col_acc2:
                 st.metric("📊 Projekte erfasst", total)
             with col_acc3:
