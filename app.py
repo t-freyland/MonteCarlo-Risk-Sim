@@ -63,9 +63,15 @@ init_db()
 # ===== NORMALE HILFSFUNKTIONEN =====
 def get_all_projects():
     conn = get_db_connection()
-    df = pd.read_sql("SELECT DISTINCT project FROM tasks UNION SELECT DISTINCT project FROM risks", conn)
+    df = pd.read_sql("""
+        SELECT DISTINCT project FROM tasks
+        UNION SELECT DISTINCT project FROM risks
+        UNION SELECT DISTINCT project FROM teams
+        UNION SELECT DISTINCT project FROM history
+        UNION SELECT DISTINCT project FROM actual_results
+    """, conn)
     conn.close()
-    projs = df['project'].tolist()
+    projs = df["project"].dropna().tolist()
     return projs if projs else ["Demo_Projekt"]
 
 def load_tasks(project):
@@ -178,6 +184,7 @@ def delete_project_complete(project):
     conn.execute("DELETE FROM risks WHERE project=?", (project,))
     conn.execute("DELETE FROM history WHERE project=?", (project,))
     conn.execute("DELETE FROM actual_results WHERE project=?", (project,))
+    conn.execute("DELETE FROM teams WHERE project=?", (project,))  # fehlte
     conn.commit()
     conn.close()
 
@@ -312,6 +319,31 @@ def convert_calendar_to_business_days(calendar_days):
     """Konvertiere Kalendertage zu Werktagen (grobe Schätzung)."""
     # Annahme: 5 Arbeitstage pro 7 Kalendertage
     return calendar_days * (5.0 / 7.0)
+
+# ===== NEU: EFFECT-LOOKUP HILFSFUNKTIONEN =====
+def _norm_risk_name(value):
+    """Normalisiert Risikonamen für robuste Vergleiche."""
+    return str(value).strip().casefold()
+
+def _build_effect_lookup(ed_r_df, selected_std_list):
+    """
+    Mapping: normalisierter Risiko-Name -> 'Threat' | 'Opportunity'
+    Projekt-Risiken aus ed_r_df haben Vorrang.
+    Standardrisiken defaulten auf Threat.
+    """
+    lookup = {}
+    if ed_r_df is not None and not ed_r_df.empty:
+        for _, rr in ed_r_df.iterrows():
+            name = str(rr.get("Risk Name", "")).strip()
+            if not name:
+                continue
+            raw_eff = str(rr.get("Effect", "Threat")).strip().casefold()
+            lookup[_norm_risk_name(name)] = "Opportunity" if raw_eff == "opportunity" else "Threat"
+    for sr in (selected_std_list or []):
+        sname = str(sr.get("name", "")).strip()
+        if sname:
+            lookup.setdefault(_norm_risk_name(sname), "Threat")
+    return lookup
 
 # --- 5. SIMULATION ---
 def run_fast_simulation(tasks, risks, std_risks, teams, n):
@@ -468,10 +500,13 @@ with st.sidebar:
         if st.button("🚀 Erstellen", use_container_width=True):
             if new_p.strip():
                 save_data(new_p, load_tasks(selected_proj), load_risks(selected_proj))
-                st.success(f"✅ Projekt '{new_p}' erstellt!")
+                st.session_state.toast_msg = f"Projekt '{new_p}' erstellt!"
+                st.session_state.toast_type = "success"
                 st.rerun()
             else:
-                st.warning("⚠️ Projekt-Name erforderlich!")
+                st.session_state.toast_msg = "Projekt-Name erforderlich!"
+                st.session_state.toast_type = "warning"
+                st.rerun()
 
         st.divider()
         t_exp = load_tasks(selected_proj)
@@ -483,7 +518,8 @@ with st.sidebar:
         st.subheader("🗑️ Daten bereinigen")
         if st.button("📊 Historie löschen", use_container_width=True):
             delete_history_only(selected_proj)
-            st.success("✅ Historie gelöscht.")
+            st.session_state.toast_msg = "Historie gelöscht."
+            st.session_state.toast_type = "success"
             st.rerun()
 
         st.divider()
@@ -493,10 +529,13 @@ with st.sidebar:
         if st.button(f"🗑️ {selected_proj} löschen", use_container_width=True, type="secondary"):
             if confirm_del:
                 delete_project_complete(selected_proj)
-                st.success(f"✅ Projekt '{selected_proj}' gelöscht.")
+                st.session_state.toast_msg = f"Projekt '{selected_proj}' gelöscht."
+                st.session_state.toast_type = "success"
                 st.rerun()
             else:
-                st.warning("⚠️ Bestätigung erforderlich!")
+                st.session_state.toast_msg = "Bestätigung erforderlich!"
+                st.session_state.toast_type = "warning"
+                st.rerun()
 
     st.divider()
     st.subheader("📊 Szenarien-Vergleich")
@@ -568,6 +607,15 @@ with st.sidebar:
 
 # --- 8. MAIN ---
 st.title(f"🎲 {selected_proj} | v{APP_VERSION}")
+
+# Toast-Feedback nach rerun anzeigen
+if st.session_state.toast_msg:
+    _icon = {"success": "✅", "error": "❌", "warning": "⚠️"}.get(
+        st.session_state.toast_type, "ℹ️")
+    st.toast(st.session_state.toast_msg, icon=_icon)
+    st.session_state.toast_msg  = None
+    st.session_state.toast_type = None
+
 st.info("📌 **Workflow:** 1️⃣ Tasks definieren & speichern → 2️⃣ Risiken konfigurieren → 3️⃣ Simulation starten")
 
 # --- TEAMS (Vereinfacht) ---
@@ -696,13 +744,21 @@ with tab_preview:
             col3.metric("Kapazität", f"{capacity}x")
             col4.metric("Effektiv", f"{effective:.1f}d", delta="CP" if effective == team_breakdown.max() / capacity else None)
         
-        critical_path_calc = max([
-            (float(ed_t[ed_t["team"] == t]["Duration (Days)"].sum()) / 
-             (float(ed_tm[ed_tm["Team"] == t]["Capacity"].iloc[0]) if not ed_tm[ed_tm["Team"] == t].empty else 1.0))
-            for t in ed_t["team"].unique()
-        ])
-        
-        st.success(f"✅ **Kritischer Pfad = {critical_path_calc:.1f} Tage** (nicht {ed_t['Duration (Days)'].sum():.0f}!)")
+        critical_path_calc = 0.0  # vor den Tabs initialisieren
+        for team in ed_t["team"].unique():
+            team_tasks = ed_t[ed_t["team"] == team]
+            team_sum = team_tasks["Duration (Days)"].sum()
+            
+            # Wende Team-Capacity an
+            if not ed_tm.empty:
+                team_row = ed_tm[ed_tm["Team"] == team]
+                if not team_row.empty:
+                    capacity = float(team_row.iloc[0].get("Capacity", 1.0))
+                    team_sum = team_sum / capacity  # Höhere Capacity = schneller
+            
+            critical_path_calc += team_sum
+    
+    st.success(f"✅ **Kritischer Pfad = {critical_path_calc:.1f} Tage** (nicht {ed_t['Duration (Days)'].sum():.0f}!)")
 
 col_t1, col_t2 = st.columns([1, 1])
 with col_t1:
@@ -883,11 +939,22 @@ if st.session_state.last_durations is not None:
     with tab2:
         st.subheader("Risiko Impact Overview (Tornado Chart)")
         if not impact_df.empty:
-            impact_df_sorted = impact_df.sort_values("Verzögerung", ascending=True)
+            impact_df_sorted = impact_df.sort_values("Verzögerung", ascending=True).copy()
+            if "Effect" not in impact_df_sorted.columns:
+                impact_df_sorted["Effect"] = "Threat"
+
+            colors = impact_df_sorted["Effect"].map({
+                "Threat": "#EF553B",
+                "Opportunity": "#2ECC71"
+            }).fillna("#636EFA")
+
             fig_tornado = go.Figure(go.Bar(
-                x=impact_df_sorted["Verzögerung"], y=impact_df_sorted["Quelle"], orientation='h',
-                marker_color=['#EF553B' if t == "Projekt" else '#636EFA' for t in impact_df_sorted["Typ"]],
-                text=impact_df_sorted["Verzögerung"].round(1), textposition='auto'
+                x=impact_df_sorted["Verzögerung"],
+                y=impact_df_sorted["Quelle"],
+                orientation="h",
+                marker_color=colors,
+                text=impact_df_sorted["Verzögerung"].round(1),
+                textposition="auto"
             ))
             fig_tornado.update_layout(template="plotly_white", xaxis_title="Ø Verzögerung in Tagen",
                                       height=max(400, len(impact_df_sorted)*40), margin=dict(l=250))
@@ -1004,14 +1071,7 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
             st.write("### 🔥 Häufigste eingetretene Risiken")
 
             # Effect-Lookup aus aktuellem Register + Standardrisiken
-            effect_lookup = {}
-            if not ed_r.empty:
-                for _, rr in ed_r.iterrows():
-                    rn = str(rr.get("Risk Name", "")).strip()
-                    if rn:
-                        effect_lookup[rn] = str(rr.get("Effect", "Threat")).strip() or "Threat"
-            for sr in selected_std:
-                effect_lookup.setdefault(str(sr.get("name", "")).strip(), "Threat")
+            effect_lookup = _build_effect_lookup(ed_r, selected_std)
 
             risk_rows = []
             for risks_json in actual_df["risks_occurred"]:
@@ -1020,23 +1080,28 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
                 try:
                     items = json.loads(risks_json)
                     if isinstance(items, list):
-                        for rname in items:
-                            name = str(rname).strip()
-                            if not name:
-                                continue
-                            risk_rows.append({
-                                "Risk": name,
-                                "Effect": effect_lookup.get(name, "Threat")
-                            })
+                        for item in items:
+                            # NEU: unterstützt {"name": "...", "effect": "..."} und altes "name"-Format
+                            if isinstance(item, dict):
+                                name = str(item.get("name", "")).strip()
+                                raw_eff = str(item.get("effect", "")).strip()
+                                eff = "Opportunity" if raw_eff.casefold() == "opportunity" else (
+                                    effect_lookup.get(_norm_risk_name(name), "Threat")
+                                )
+                            else:
+                                name = str(item).strip()
+                                eff = effect_lookup.get(_norm_risk_name(name), "Threat")
+
+                            if name:
+                                risk_rows.append({"Risk": name, "Effect": eff})
                 except json.JSONDecodeError:
                     pass
 
             if risk_rows:
                 risk_df = pd.DataFrame(risk_rows)
-
-                # Kennzahlen
-                threat_hits = int((risk_df["Effect"] != "Opportunity").sum())
-                opp_hits = int((risk_df["Effect"] == "Opportunity").sum())
+                opp_mask = risk_df["Effect"].astype(str).str.casefold().eq("opportunity")
+                threat_hits = int((~opp_mask).sum())
+                opp_hits = int(opp_mask.sum())
                 c_rt1, c_rt2 = st.columns(2)
                 c_rt1.metric("⚠️ Threat-Eintritte", threat_hits)
                 c_rt2.metric("🚀 Opportunity-Eintritte", opp_hits)
@@ -1226,13 +1291,22 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
                                  else projected_end)
                     )
 
+                    effect_lookup_live = _build_effect_lookup(ed_r, selected_std)
+                    risks_payload = [
+                        {
+                            "name": str(rn).strip(),
+                            "effect": effect_lookup_live.get(_norm_risk_name(rn), "Threat")
+                        }
+                        for rn in risiken_jetzt
+                    ]
+
                     save_actual_result(
                         selected_proj,
                         str(actual_start),
                         planned_end_str,
                         str(projected_end.date() if hasattr(projected_end, 'date') else projected_end),
                         str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
-                        risiken_jetzt,
+                        risks_payload,  # statt risiken_jetzt
                         f"[ZWISCHENSTAND {fertig_prozent}%] {notiz_zwischen}"
                     )
                     st.session_state.toast_msg  = f"Zwischenstand ({fertig_prozent}%) gespeichert!"
@@ -1263,13 +1337,22 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
                         else str(actual_end_final)
                     )
 
+                    effect_lookup_live = _build_effect_lookup(ed_r, selected_std)
+                    risks_payload = [
+                        {
+                            "name": str(rn).strip(),
+                            "effect": effect_lookup_live.get(_norm_risk_name(rn), "Threat")
+                        }
+                        for rn in risks_that_occurred
+                    ]
+
                     save_actual_result(
                         selected_proj,
                         str(actual_start),
                         planned_end_str,
                         str(actual_end_final),
                         str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
-                        risks_that_occurred,
+                        risks_payload,  # statt risks_that_occurred
                         f"[ABSCHLUSS] {actual_notes}"
                     )
                     st.session_state.toast_msg  = "Projektabschluss gespeichert!"
