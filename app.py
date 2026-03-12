@@ -8,7 +8,7 @@ from datetime import datetime
 import plotly.graph_objects as go
 
 # --- 1. SETUP & CONFIG ---
-APP_VERSION = "2.5.1"  # Updated mit Backtesting-Funktionen
+APP_VERSION = "3.0.0"
 DB_FILE = "risk_management.db"
 
 st.set_page_config(page_title=f"Risk Sim Pro v{APP_VERSION}", layout="wide")
@@ -20,7 +20,7 @@ for key in [
     "last_end_dates", "last_top_r", "last_diff",
     "last_warning_msg", "last_rec", "last_history_df",
     "demo_mode", "std_risk_df",
-    "toast_msg", "toast_type",   # NEU
+    "toast_msg", "toast_type",
 ]:
     if key not in st.session_state:
         st.session_state[key] = None
@@ -41,295 +41,30 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS teams (
             id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT,
             team_name TEXT, capacity REAL DEFAULT 1.0)""")
-
-    # Migration — HIER noch VOR commit/close
     for sql in [
         "ALTER TABLE risks ADD COLUMN effect TEXT DEFAULT 'Threat'",
-        "ALTER TABLE tasks ADD COLUMN team TEXT DEFAULT 'Sequenziell'",
+        "ALTER TABLE tasks ADD COLUMN team TEXT DEFAULT 'Sequential'",
         "ALTER TABLE tasks ADD COLUMN sequence INTEGER DEFAULT 0",
     ]:
         try:
             conn.execute(sql)
         except sqlite3.OperationalError:
             pass
-
     conn.commit()
-    conn.close()   # NUR EINMAL schließen
+    conn.close()
 
 init_db()
 
-# --- 4. HILFSFUNKTIONEN ---
+# --- 4. HELPER FUNCTIONS ---
 
-# ===== NORMALE HILFSFUNKTIONEN =====
-def get_all_projects():
-    conn = get_db_connection()
-    df = pd.read_sql("""
-        SELECT DISTINCT project FROM tasks
-        UNION SELECT DISTINCT project FROM risks
-        UNION SELECT DISTINCT project FROM teams
-        UNION SELECT DISTINCT project FROM history
-        UNION SELECT DISTINCT project FROM actual_results
-    """, conn)
-    conn.close()
-    projs = df["project"].dropna().tolist()
-    return projs if projs else ["Demo_Projekt"]
-
-def load_tasks(project):
-    """Lade alle Tasks für ein Projekt."""
-    conn = get_db_connection()
-    cols = pd.read_sql("PRAGMA table_info(tasks)", conn)["name"].tolist()
-    has_team = "team" in cols
-    q = """
-        SELECT task_name as 'Task Name', duration as 'Duration (Days)',
-               description as 'Beschreibung',
-               {} as 'team'
-        FROM tasks WHERE project=? ORDER BY id
-    """.format("COALESCE(team, 'Sequenziell')" if has_team else "'Sequenziell'")
-    df = pd.read_sql(q, conn, params=(project,))
-    conn.close()
-    if df.empty:
-        df = pd.DataFrame([{"Task Name": "Basis-Task", "Duration (Days)": 10.0,
-                            "Beschreibung": "", "team": "Sequenziell"}])
-    return df.reset_index(drop=True)
-
-def load_risks(project):
-    """Lade alle Risiken für ein Projekt."""
-    conn = get_db_connection()
-    df = pd.read_sql("""
-        SELECT risk_name as 'Risk Name', risk_type as 'Risk Type',
-               target as 'Target (Global/Task)', prob as 'Probability (0-1)',
-               impact_min as 'Impact Min', impact_likely as 'Impact Likely',
-               impact_max as 'Impact Max', mitigation as 'Maßnahme / Mitigation',
-               COALESCE(effect, 'Threat') as 'Effect'
-        FROM risks WHERE project=?
-    """, conn, params=(project,))
-    conn.close()
-    if "Effect" not in df.columns:
-        df["Effect"] = "Threat"
-    df["Effect"] = df["Effect"].fillna("Threat")
-    return df.reset_index(drop=True)
-
-def save_data(project, df_tasks, df_risks):
-    """Speichere Tasks und Risiken für ein Projekt."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM tasks WHERE project=?", (project,))
-    conn.execute("DELETE FROM risks WHERE project=?", (project,))
-    for idx, row in df_tasks.iterrows():
-        task_name = str(row.get("Task Name", "")).strip()
-        if task_name:
-            try:
-                duration = float(row["Duration (Days)"])
-                if duration > 0:
-                    conn.execute(
-                        "INSERT INTO tasks (project, task_name, duration, description, team, sequence) VALUES (?,?,?,?,?,?)",
-                        (project, task_name, duration,
-                         str(row.get("Beschreibung", "")),
-                         str(row.get("team", "Sequenziell")),  # team speichern
-                         int(idx)))
-            except (ValueError, TypeError):
-                pass
-    for _, row in df_risks.iterrows():
-        risk_name = str(row.get("Risk Name", "")).strip()
-        if risk_name:
-            try:
-                prob = float(row.get("Probability (0-1)", 0))
-                if 0 <= prob <= 1:
-                    conn.execute("""
-                        INSERT INTO risks 
-                        (project, risk_name, risk_type, target, prob,
-                         impact_min, impact_likely, impact_max, mitigation, effect)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)
-                    """, (project, risk_name, str(row.get("Risk Type", "Binär")),
-                          str(row.get("Target (Global/Task)", "Global")),
-                          prob, float(row.get("Impact Min", 0)),
-                          float(row.get("Impact Likely", 0)),
-                          float(row.get("Impact Max", 0)),
-                          str(row.get("Maßnahme / Mitigation", "")),
-                          str(row.get("Effect", "Threat"))))  # effect ergänzt
-            except (ValueError, TypeError):
-                pass
-    conn.commit()
-    conn.close()
-
-def save_history(project, target_date, buffer, top_risk):
-    """Speichere die Mess-Historie."""
-    conn = get_db_connection()
-    conn.execute("INSERT INTO history (project, timestamp, target_date, buffer, top_risk) VALUES (?,?,?,?,?)",
-                 (project, datetime.now().strftime('%Y-%m-%d %H:%M'), target_date, buffer, top_risk))
-    conn.commit()
-    conn.close()
-
-def delete_history_only(project):
-    """Lösche die Mess-Historie für ein Projekt."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM history WHERE project=?", (project,))
-    conn.commit()
-    conn.close()
-
-def load_history(project):
-    """Lade die Mess-Historie für ein Projekt."""
-    conn = get_db_connection()
-    df = pd.read_sql(
-        "SELECT timestamp, target_date, buffer, top_risk FROM history WHERE project=? ORDER BY timestamp ASC",
-        conn,
-        params=(project,)
-    )
-    conn.close()
-    return df
-
-def delete_project_complete(project):
-    """Lösche ein Projekt komplett mit allen zugehörigen Daten."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM tasks WHERE project=?", (project,))
-    conn.execute("DELETE FROM risks WHERE project=?", (project,))
-    conn.execute("DELETE FROM history WHERE project=?", (project,))
-    conn.execute("DELETE FROM actual_results WHERE project=?", (project,))
-    conn.execute("DELETE FROM teams WHERE project=?", (project,))  # fehlte
-    conn.commit()
-    conn.close()
-
-def save_actual_result(project, start_date, planned_end, actual_end, top_risk, risks_occurred, notes=""):
-    """Speichere tatsächliches Projektergebnis für Backtesting."""
-    conn = get_db_connection()
-    planned_days = (pd.to_datetime(planned_end) - pd.to_datetime(start_date)).days
-    actual_days = (pd.to_datetime(actual_end) - pd.to_datetime(start_date)).days
-    buffer_used = actual_days - planned_days
-    
-    conn.execute("""
-        INSERT INTO actual_results 
-        (project, start_date, planned_end_date, actual_end_date, 
-         planned_duration, actual_duration, buffer_used, top_risk, risks_occurred, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (project, start_date, planned_end, actual_end, planned_days, actual_days, 
-          buffer_used, top_risk, json.dumps(risks_occurred), notes))
-    conn.commit()
-    conn.close()
-
-def load_actual_results(project):
-    """Lade tatsächliche Ergebnisse für Validierung."""
-    conn = get_db_connection()
-    df = pd.read_sql("""
-        SELECT start_date, planned_end_date, actual_end_date, 
-               planned_duration, actual_duration, buffer_used, 
-               top_risk, risks_occurred, notes
-        FROM actual_results 
-        WHERE project = ? 
-        ORDER BY actual_end_date ASC
-    """, conn, params=(project,))
-    conn.close()
-    return df
-
-def get_default_standard_risks_df():
-    return pd.DataFrame([
-        {"Aktiv": True,  "name": "Schätz-Ungenauigkeit",        "type": "Kontinuierlich", "prob": 1.00, "min": -0.03, "likely": 0.00, "max": 0.08},
-        {"Aktiv": True,  "name": "Scope Creep",                  "type": "Binär",          "prob": 0.40, "min":  0.05, "likely": 0.15, "max": 0.30},
-        {"Aktiv": True,  "name": "Technische Schulden",           "type": "Kontinuierlich", "prob": 1.00, "min":  0.03, "likely": 0.07, "max": 0.15},
-        {"Aktiv": True,  "name": "Personalfluktuation",           "type": "Binär",          "prob": 0.20, "min":  0.05, "likely": 0.12, "max": 0.25},
-        {"Aktiv": True,  "name": "Krankheit / Ausfall",           "type": "Binär",          "prob": 0.25, "min":  0.03, "likely": 0.08, "max": 0.15},
-        {"Aktiv": True,  "name": "Integrationsprobleme",          "type": "Binär",          "prob": 0.35, "min":  0.04, "likely": 0.10, "max": 0.22},
-        {"Aktiv": True,  "name": "Test- und QA-Nacharbeit",       "type": "Kontinuierlich", "prob": 1.00, "min":  0.02, "likely": 0.06, "max": 0.12},
-        {"Aktiv": True,  "name": "Abhängigkeiten extern",         "type": "Binär",          "prob": 0.30, "min":  0.05, "likely": 0.12, "max": 0.25},
-        {"Aktiv": True,  "name": "Deployment-/Release-Risiko",    "type": "Binär",          "prob": 0.22, "min":  0.03, "likely": 0.07, "max": 0.16},
-        {"Aktiv": True,  "name": "Anforderungsunklarheit",        "type": "Kontinuierlich", "prob": 1.00, "min":  0.02, "likely": 0.05, "max": 0.11},
-        {"Aktiv": False, "name": "Umgebungs-/Tooling-Probleme",   "type": "Binär",          "prob": 0.18, "min":  0.02, "likely": 0.06, "max": 0.12},
-        {"Aktiv": False, "name": "Security-/Compliance-Auflagen", "type": "Binär",          "prob": 0.15, "min":  0.03, "likely": 0.09, "max": 0.20},
-    ])
-
-def load_teams(project):
-    """Lade alle Teams für ein Projekt."""
-    conn = get_db_connection()
-    df = pd.read_sql(
-        "SELECT team_name as 'Team', capacity as 'Capacity' FROM teams WHERE project=? ORDER BY team_name",
-        conn, params=(project,)
-    )
-    conn.close()
-    if df.empty:
-        df = pd.DataFrame([{"Team": "Standard", "Capacity": 1.0}])
-    return df.reset_index(drop=True)
-
-def save_teams(project, df_teams):
-    """Speichere Teams für ein Projekt."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM teams WHERE project=?", (project,))
-    for _, row in df_teams.iterrows():
-        team_name = str(row.get("Team", "")).strip()
-        if team_name:
-            try:
-                capacity = float(row.get("Capacity", 1.0))
-                if capacity > 0:
-                    conn.execute("INSERT INTO teams (project, team_name, capacity) VALUES (?,?,?)",
-                                 (project, team_name, capacity))
-            except (ValueError, TypeError):
-                pass
-    conn.commit()
-    conn.close()
-
-def calculate_critical_path(tasks_df):
-    """Berechne den kritischen Pfad (längste Sequenz pro Team)."""
-    if tasks_df.empty or "Duration (Days)" not in tasks_df.columns:
-        return 0.0
-    
-    if "team" not in tasks_df.columns:
-        return float(tasks_df["Duration (Days)"].sum())
-    
-    # Gruppiere nach Team und summiere Dauern
-    team_durations = tasks_df.groupby("team")["Duration (Days)"].sum()
-    return float(team_durations.max()) if not team_durations.empty else 0.0
-
-# ===== WERKTAGE-FUNKTIONEN =====
-def add_business_days(start_date, num_days):
-    """Addiere Werktage (Mo-Fr) zu einem Datum."""
-    current = pd.to_datetime(start_date)
-    days_added = 0
-    
-    while days_added < num_days:
-        current += pd.Timedelta(days=1)
-        # 0=Mo, 1=Di, ..., 4=Fr, 5=Sa, 6=So
-        if current.weekday() < 5:  # Montag bis Freitag
-            days_added += 1
-    
-    return current
-
-# Deutsche Feiertage 2024-2026 (hardcoded)
-GERMAN_HOLIDAYS = [
-    "2024-01-01", "2024-03-29", "2024-03-30", "2024-04-01", "2024-05-01",
-    "2024-05-09", "2024-05-19", "2024-05-30", "2024-10-03", "2024-12-25", "2024-12-26",
-    "2025-01-01", "2025-04-18", "2025-04-19", "2025-04-21", "2025-05-01",
-    "2025-05-08", "2025-05-29", "2025-06-09", "2025-10-03", "2025-12-25", "2025-12-26",
-    "2026-01-01", "2026-04-10", "2026-04-11", "2026-04-13", "2026-05-01",
-    "2026-05-21", "2026-05-31", "2026-06-11", "2026-10-03", "2026-12-25", "2026-12-26",
-]
-
-def add_business_days_with_holidays(start_date, num_days):
-    """Addiere Werktage (Mo-Fr, ohne deutsche Feiertage)."""
-    current = pd.to_datetime(start_date)
-    days_added = 0
-    holiday_set = set(pd.to_datetime(GERMAN_HOLIDAYS).strftime('%Y-%m-%d'))
-    
-    while days_added < num_days:
-        current += pd.Timedelta(days=1)
-        date_str = current.strftime('%Y-%m-%d')
-        # Werktag UND kein Feiertag
-        if current.weekday() < 5 and date_str not in holiday_set:
-            days_added += 1
-    
-    return current
-
-def convert_calendar_to_business_days(calendar_days):
-    """Konvertiere Kalendertage zu Werktagen (grobe Schätzung)."""
-    # Annahme: 5 Arbeitstage pro 7 Kalendertage
-    return calendar_days * (5.0 / 7.0)
-
-# ===== NEU: EFFECT-LOOKUP HILFSFUNKTIONEN =====
 def _norm_risk_name(value):
-    """Normalisiert Risikonamen für robuste Vergleiche."""
+    """Normalize risk names for robust lookups."""
     return str(value).strip().casefold()
 
 def _build_effect_lookup(ed_r_df, selected_std_list):
     """
-    Mapping: normalisierter Risiko-Name -> 'Threat' | 'Opportunity'
-    Projekt-Risiken aus ed_r_df haben Vorrang.
-    Standardrisiken defaulten auf Threat.
+    Mapping: normalized risk name -> 'Threat' | 'Opportunity'
+    Project risks take precedence, standard risks default to Threat.
     """
     lookup = {}
     if ed_r_df is not None and not ed_r_df.empty:
@@ -345,49 +80,299 @@ def _build_effect_lookup(ed_r_df, selected_std_list):
             lookup.setdefault(_norm_risk_name(sname), "Threat")
     return lookup
 
+def get_all_projects():
+    conn = get_db_connection()
+    df = pd.read_sql("""
+        SELECT DISTINCT project FROM tasks
+        UNION SELECT DISTINCT project FROM risks
+        UNION SELECT DISTINCT project FROM teams
+        UNION SELECT DISTINCT project FROM history
+        UNION SELECT DISTINCT project FROM actual_results
+    """, conn)
+    conn.close()
+    projs = df["project"].dropna().tolist()
+    return projs if projs else ["Demo_Project"]
+
+def load_tasks(project):
+    conn = get_db_connection()
+    cols = pd.read_sql("PRAGMA table_info(tasks)", conn)["name"].tolist()
+    has_team = "team" in cols
+    q = """
+        SELECT task_name as 'Task Name', duration as 'Duration (Days)',
+               description as 'Description',
+               {} as 'team'
+        FROM tasks WHERE project=? ORDER BY id
+    """.format("COALESCE(team, 'Sequential')" if has_team else "'Sequential'")
+    df = pd.read_sql(q, conn, params=(project,))
+    conn.close()
+    if df.empty:
+        df = pd.DataFrame([{"Task Name": "Base Task", "Duration (Days)": 10.0,
+                            "Description": "", "team": "Sequential"}])
+    return df.reset_index(drop=True)
+
+def load_risks(project):
+    conn = get_db_connection()
+    df = pd.read_sql("""
+        SELECT risk_name as 'Risk Name', risk_type as 'Risk Type',
+               target as 'Target (Global/Task)', prob as 'Probability (0-1)',
+               impact_min as 'Impact Min', impact_likely as 'Impact Likely',
+               impact_max as 'Impact Max', mitigation as 'Mitigation',
+               COALESCE(effect, 'Threat') as 'Effect'
+        FROM risks WHERE project=?
+    """, conn, params=(project,))
+    conn.close()
+    if "Effect" not in df.columns:
+        df["Effect"] = "Threat"
+    df["Effect"] = df["Effect"].fillna("Threat")
+    return df.reset_index(drop=True)
+
+def save_data(project, df_tasks, df_risks):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM tasks WHERE project=?", (project,))
+    conn.execute("DELETE FROM risks WHERE project=?", (project,))
+    for idx, row in df_tasks.iterrows():
+        task_name = str(row.get("Task Name", "")).strip()
+        if task_name:
+            try:
+                duration = float(row["Duration (Days)"])
+                if duration > 0:
+                    conn.execute(
+                        "INSERT INTO tasks (project, task_name, duration, description, team, sequence) VALUES (?,?,?,?,?,?)",
+                        (project, task_name, duration,
+                         str(row.get("Description", "")),
+                         str(row.get("team", "Sequential")),
+                         int(idx)))
+            except (ValueError, TypeError):
+                pass
+    for _, row in df_risks.iterrows():
+        risk_name = str(row.get("Risk Name", "")).strip()
+        if risk_name:
+            try:
+                prob = float(row.get("Probability (0-1)", 0))
+                if 0 <= prob <= 1:
+                    conn.execute("""
+                        INSERT INTO risks
+                        (project, risk_name, risk_type, target, prob,
+                         impact_min, impact_likely, impact_max, mitigation, effect)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """, (project, risk_name, str(row.get("Risk Type", "Binary")),
+                          str(row.get("Target (Global/Task)", "Global")),
+                          prob, float(row.get("Impact Min", 0)),
+                          float(row.get("Impact Likely", 0)),
+                          float(row.get("Impact Max", 0)),
+                          str(row.get("Mitigation", "")),
+                          str(row.get("Effect", "Threat"))))
+            except (ValueError, TypeError):
+                pass
+    conn.commit()
+    conn.close()
+
+def save_history(project, target_date, buffer, top_risk):
+    conn = get_db_connection()
+    conn.execute("INSERT INTO history (project, timestamp, target_date, buffer, top_risk) VALUES (?,?,?,?,?)",
+                 (project, datetime.now().strftime('%Y-%m-%d %H:%M'), target_date, buffer, top_risk))
+    conn.commit()
+    conn.close()
+
+def delete_history_only(project):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM history WHERE project=?", (project,))
+    conn.commit()
+    conn.close()
+
+def load_history(project):
+    conn = get_db_connection()
+    df = pd.read_sql(
+        "SELECT timestamp, target_date, buffer, top_risk FROM history WHERE project=? ORDER BY timestamp ASC",
+        conn, params=(project,))
+    conn.close()
+    return df
+
+def delete_project_complete(project):
+    conn = get_db_connection()
+    for tbl in ["tasks", "risks", "history", "actual_results", "teams"]:
+        conn.execute(f"DELETE FROM {tbl} WHERE project=?", (project,))
+    conn.commit()
+    conn.close()
+
+def save_actual_result(project, start_date, planned_end, actual_end, top_risk, risks_occurred, notes=""):
+    conn = get_db_connection()
+    planned_days = (pd.to_datetime(planned_end) - pd.to_datetime(start_date)).days
+    actual_days  = (pd.to_datetime(actual_end)  - pd.to_datetime(start_date)).days
+    buffer_used  = actual_days - planned_days
+    conn.execute("""
+        INSERT INTO actual_results
+        (project, start_date, planned_end_date, actual_end_date,
+         planned_duration, actual_duration, buffer_used, top_risk, risks_occurred, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (project, start_date, planned_end, actual_end,
+          planned_days, actual_days, buffer_used,
+          top_risk, json.dumps(risks_occurred), notes))
+    conn.commit()
+    conn.close()
+
+def load_actual_results(project):
+    conn = get_db_connection()
+    df = pd.read_sql("""
+        SELECT start_date, planned_end_date, actual_end_date,
+               planned_duration, actual_duration, buffer_used,
+               top_risk, risks_occurred, notes
+        FROM actual_results WHERE project = ? ORDER BY actual_end_date ASC
+    """, conn, params=(project,))
+    conn.close()
+    return df
+
+def get_default_standard_risks_df():
+    return pd.DataFrame([
+        {"Active": True,  "name": "Estimation Inaccuracy",      "type": "Continuous", "prob": 1.00, "min": -0.03, "likely": 0.00, "max": 0.08},
+        {"Active": True,  "name": "Scope Creep",                "type": "Binary",     "prob": 0.40, "min":  0.05, "likely": 0.15, "max": 0.30},
+        {"Active": True,  "name": "Technical Debt",             "type": "Continuous", "prob": 1.00, "min":  0.03, "likely": 0.07, "max": 0.15},
+        {"Active": True,  "name": "Staff Turnover",             "type": "Binary",     "prob": 0.20, "min":  0.05, "likely": 0.12, "max": 0.25},
+        {"Active": True,  "name": "Illness / Absence",          "type": "Binary",     "prob": 0.25, "min":  0.03, "likely": 0.08, "max": 0.15},
+        {"Active": True,  "name": "Integration Issues",         "type": "Binary",     "prob": 0.35, "min":  0.04, "likely": 0.10, "max": 0.22},
+        {"Active": True,  "name": "Testing & QA Rework",        "type": "Continuous", "prob": 1.00, "min":  0.02, "likely": 0.06, "max": 0.12},
+        {"Active": True,  "name": "External Dependencies",      "type": "Binary",     "prob": 0.30, "min":  0.05, "likely": 0.12, "max": 0.25},
+        {"Active": True,  "name": "Deployment / Release Risk",  "type": "Binary",     "prob": 0.22, "min":  0.03, "likely": 0.07, "max": 0.16},
+        {"Active": True,  "name": "Requirements Ambiguity",     "type": "Continuous", "prob": 1.00, "min":  0.02, "likely": 0.05, "max": 0.11},
+        {"Active": False, "name": "Tooling / Environment",      "type": "Binary",     "prob": 0.18, "min":  0.02, "likely": 0.06, "max": 0.12},
+        {"Active": False, "name": "Security / Compliance",      "type": "Binary",     "prob": 0.15, "min":  0.03, "likely": 0.09, "max": 0.20},
+    ])
+
+def load_teams(project):
+    conn = get_db_connection()
+    df = pd.read_sql(
+        "SELECT team_name as 'Team', capacity as 'Capacity' FROM teams WHERE project=? ORDER BY team_name",
+        conn, params=(project,))
+    conn.close()
+    if df.empty:
+        df = pd.DataFrame([{"Team": "Standard", "Capacity": 1.0}])
+    return df.reset_index(drop=True)
+
+def save_teams(project, df_teams):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM teams WHERE project=?", (project,))
+    for _, row in df_teams.iterrows():
+        team_name = str(row.get("Team", "")).strip()
+        if team_name:
+            try:
+                capacity = float(row.get("Capacity", 1.0))
+                if capacity > 0:
+                    conn.execute("INSERT INTO teams (project, team_name, capacity) VALUES (?,?,?)",
+                                 (project, team_name, capacity))
+            except (ValueError, TypeError):
+                pass
+    conn.commit()
+    conn.close()
+
+# ===== EXPORT COMPLETE PROJECT =====
+def export_complete_project(project):
+    """Export all project data as a complete JSON package."""
+    tasks   = load_tasks(project)
+    risks   = load_risks(project)
+    teams   = load_teams(project)
+    history = load_history(project)
+    actual  = load_actual_results(project)
+
+    payload = {
+        "export_version": APP_VERSION,
+        "export_date":    datetime.now().strftime('%Y-%m-%d %H:%M'),
+        "project":        project,
+        "tasks":          tasks.to_dict(orient="records"),
+        "risks":          risks.to_dict(orient="records"),
+        "teams":          teams.to_dict(orient="records"),
+        "history":        history.to_dict(orient="records"),
+        "actual_results": actual.to_dict(orient="records"),
+    }
+    return json.dumps(payload, indent=2, default=str)
+
+def import_complete_project(json_str):
+    """Import a complete project from JSON. Returns project name or raises."""
+    data    = json.loads(json_str)
+    project = data.get("project", "Imported_Project")
+
+    if data.get("tasks"):
+        save_data(project,
+                  pd.DataFrame(data["tasks"]),
+                  pd.DataFrame(data.get("risks", [])))
+    if data.get("teams"):
+        save_teams(project, pd.DataFrame(data["teams"]))
+
+    conn = get_db_connection()
+    for row in data.get("history", []):
+        try:
+            conn.execute(
+                "INSERT INTO history (project, timestamp, target_date, buffer, top_risk) VALUES (?,?,?,?,?)",
+                (project, row.get("timestamp"), row.get("target_date"),
+                 row.get("buffer"), row.get("top_risk")))
+        except Exception:
+            pass
+    for row in data.get("actual_results", []):
+        try:
+            conn.execute("""
+                INSERT INTO actual_results
+                (project, start_date, planned_end_date, actual_end_date,
+                 planned_duration, actual_duration, buffer_used, top_risk, risks_occurred, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (project, row.get("start_date"), row.get("planned_end_date"),
+                  row.get("actual_end_date"), row.get("planned_duration"),
+                  row.get("actual_duration"), row.get("buffer_used"),
+                  row.get("top_risk"), row.get("risks_occurred"), row.get("notes")))
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    return project
+
+# ===== BUSINESS DAYS =====
+GERMAN_HOLIDAYS = [
+    "2024-01-01","2024-03-29","2024-04-01","2024-05-01","2024-05-09",
+    "2024-05-19","2024-05-30","2024-10-03","2024-12-25","2024-12-26",
+    "2025-01-01","2025-04-18","2025-04-21","2025-05-01","2025-05-29",
+    "2025-06-09","2025-10-03","2025-12-25","2025-12-26",
+    "2026-01-01","2026-04-10","2026-04-13","2026-05-01","2026-05-21",
+    "2026-06-11","2026-10-03","2026-12-25","2026-12-26",
+]
+
+def add_business_days_with_holidays(start_date, num_days):
+    current     = pd.to_datetime(start_date)
+    days_added  = 0
+    holiday_set = set(pd.to_datetime(GERMAN_HOLIDAYS).strftime('%Y-%m-%d'))
+    while days_added < num_days:
+        current += pd.Timedelta(days=1)
+        if current.weekday() < 5 and current.strftime('%Y-%m-%d') not in holiday_set:
+            days_added += 1
+    return current
+
 # --- 5. SIMULATION ---
 def run_fast_simulation(tasks, risks, std_risks, teams, n):
-    """
-    Monte-Carlo Simulation mit Team-Parallelisierung.
-    - Tasks innerhalb eines Teams: SEQUENZIELL
-    - Verschiedene Teams: PARALLEL
-    """
     if tasks.empty or tasks["Duration (Days)"].sum() <= 0:
-        raise ValueError("Keine gültigen Tasks definiert oder alle Dauern = 0")
+        raise ValueError("No valid tasks defined or all durations = 0")
 
-    # Fülle fehlende Team-Spalte
     tasks_copy = tasks.copy()
     if "team" not in tasks_copy.columns:
-        tasks_copy["team"] = "Sequenziell"
-    
-    # Berechne Basis-Dauer: kritischer Pfad (längste Team-Sequenz)
+        tasks_copy["team"] = "Sequential"
+
     team_durations = {}
     for team_name in tasks_copy["team"].unique():
         team_tasks = tasks_copy[tasks_copy["team"] == team_name]
-        team_sum = team_tasks["Duration (Days)"].sum()
-        
-        # Wende Team-Capacity an
+        team_sum   = team_tasks["Duration (Days)"].sum()
         if not teams.empty:
             team_row = teams[teams["Team"] == team_name]
             if not team_row.empty:
                 capacity = float(team_row.iloc[0].get("Capacity", 1.0))
-                team_sum = team_sum / capacity  # Höhere Capacity = schneller
-        
+                team_sum = team_sum / capacity
         team_durations[team_name] = team_sum
-    
-    # Kritischer Pfad = längste Dauer aller Teams
-    base_sum = max(team_durations.values()) if team_durations else tasks_copy["Duration (Days)"].sum()
-    
+
+    base_sum   = max(team_durations.values()) if team_durations else tasks_copy["Duration (Days)"].sum()
     total_days = np.full(n, base_sum, dtype=float)
     impact_results = []
 
-    # --- PROZESS-RISIKEN (wirken auf Tasks) ---
     for _, r in risks.iterrows():
-        p = float(r.get("Probability (0-1)", 0))
-        rtype = str(r.get("Risk Type", "Binär")).strip().lower()
-        target = str(r.get("Target (Global/Task)", "Global")).strip()
-        effect = str(r.get("Effect", "Threat")).strip().lower()       # NEU
-        direction = -1.0 if effect == "opportunity" else 1.0          # NEU
+        p         = float(r.get("Probability (0-1)", 0))
+        rtype     = str(r.get("Risk Type", "Binary")).strip().lower()
+        target    = str(r.get("Target (Global/Task)", "Global")).strip()
+        effect    = str(r.get("Effect", "Threat")).strip().casefold()
+        direction = -1.0 if effect == "opportunity" else 1.0
         task_team = "Global"
 
         mins = float(r.get("Impact Min", 0))
@@ -395,62 +380,54 @@ def run_fast_simulation(tasks, risks, std_risks, teams, n):
         maxv = float(r.get("Impact Max", lik))
 
         impacts = np.random.triangular(mins, lik, max(maxv, lik + 1e-6), size=n)
-        hits    = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
+        hits    = np.ones(n, dtype=bool) if rtype in ("continuous", "kontinuierlich") else (np.random.random(n) < p)
 
-        # Bestimme betroffene Dauer
         if target.lower() == "global":
-            # Global = wirkt auf kritischen Pfad
             relevant_dur = base_sum
         else:
-            # Task-spezifisch = wirkt nur auf diese Task
             match = tasks_copy[tasks_copy["Task Name"] == target]
             if not match.empty:
                 relevant_dur = float(match["Duration (Days)"].iloc[0])
-                # Wenn Task in schnellerem Team: Risiko-Dauer auch proportional schneller
-                task_team = match.iloc[0].get("team", "Sequenziell")
+                task_team    = str(match.iloc[0].get("team", "Sequential"))
                 if not teams.empty:
                     team_row = teams[teams["Team"] == task_team]
                     if not team_row.empty:
-                        capacity = float(team_row.iloc[0].get("Capacity", 1.0))
-                        relevant_dur = relevant_dur / capacity
+                        relevant_dur /= float(team_row.iloc[0].get("Capacity", 1.0))
             else:
                 relevant_dur = 0.0
 
         if relevant_dur <= 0:
             continue
 
-        # Addiere Risiko-Verzögerung zum kritischen Pfad
         delay   = impacts * relevant_dur
-        applied = (delay if rtype == "kontinuierlich" else hits * delay) * direction  # direction anwenden
+        applied = (delay if rtype in ("continuous", "kontinuierlich") else hits * delay) * direction
         total_days += applied
 
         impact_results.append({
-            "Quelle":      str(r.get("Risk Name", "Unbekannt")),
-            "Verzögerung": float(applied.mean()),
-            "Typ":         "Projekt",
-            "Team":        task_team,
-            "Effect":      "Opportunity" if direction < 0 else "Threat"  # NEU
+            "Source":   str(r.get("Risk Name", "Unknown")),
+            "Delay":    float(applied.mean()),
+            "Type":     "Project",
+            "Team":     task_team,
+            "Effect":   "Opportunity" if direction < 0 else "Threat"
         })
 
-    # --- STANDARD-RISIKEN ---
     for sr in std_risks:
-        rtype = str(sr.get("type", "Binär")).strip().lower()
-        p = float(sr.get("prob", 0))
-        mins = float(sr.get("min", 0))
-        lik = float(sr.get("likely", mins))
-        maxv = float(sr.get("max", lik))
-        
+        rtype   = str(sr.get("type", "Binary")).strip().lower()
+        p       = float(sr.get("prob", 0))
+        mins    = float(sr.get("min", 0))
+        lik     = float(sr.get("likely", mins))
+        maxv    = float(sr.get("max", lik))
         impacts = np.random.triangular(mins, lik, max(maxv, lik + 1e-6), size=n)
-        hits = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
-        delay = impacts * base_sum
-        total_days += delay if rtype == "kontinuierlich" else (hits * delay)
-        
-        avg_delay = float(delay.mean()) if rtype == "kontinuierlich" else float((hits * delay).mean())
+        hits    = np.ones(n, dtype=bool) if rtype in ("continuous", "kontinuierlich") else (np.random.random(n) < p)
+        delay   = impacts * base_sum
+        applied = delay if rtype in ("continuous", "kontinuierlich") else (hits * delay)
+        total_days += applied
         impact_results.append({
-            "Quelle": f"STD: {sr['name']}", 
-            "Verzögerung": avg_delay, 
-            "Typ": "Standard",
-            "Team": "Global"
+            "Source": f"STD: {sr['name']}",
+            "Delay":  float(applied.mean()),
+            "Type":   "Standard",
+            "Team":   "Global",
+            "Effect": "Threat"
         })
 
     total_days = np.clip(total_days, 0, 10000)
@@ -462,153 +439,186 @@ if not st.session_state.auth_ok:
     st.divider()
     col_login1, col_login2 = st.columns([1.5, 1])
     with col_login1:
-        st.subheader("Anmeldung")
+        st.subheader("Sign In")
         u = st.text_input("👤 Username", placeholder="admin")
         p = st.text_input("🔑 Password", type="password", placeholder="••••••")
-        if st.button("🔓 Anmelden", use_container_width=True):
-            if "credentials" in st.secrets and u == st.secrets["credentials"]["username"] and p == st.secrets["credentials"]["password"]:
-                st.session_state.auth_ok = True
+        if st.button("🔓 Sign In", use_container_width=True):
+            if ("credentials" in st.secrets
+                    and u == st.secrets["credentials"]["username"]
+                    and p == st.secrets["credentials"]["password"]):
+                st.session_state.auth_ok   = True
                 st.session_state.demo_mode = False
                 st.rerun()
             else:
-                st.error("❌ Ungültige Anmeldedaten.")
+                st.error("❌ Invalid credentials.")
     with col_login2:
-        st.subheader("Demo-Modus")
-        st.info("ℹ️ Testen Sie die App ohne Login.")
-        if st.button("🎮 Demo starten", use_container_width=True):
-            st.session_state.auth_ok = True
+        st.subheader("Demo Mode")
+        st.info("ℹ️ Try the app without login.")
+        if st.button("🎮 Start Demo", use_container_width=True):
+            st.session_state.auth_ok   = True
             st.session_state.demo_mode = True
             st.rerun()
     st.stop()
 
 # --- 7. SIDEBAR ---
 with st.sidebar:
-    st.header("📂 Projekt-Steuerung")
+    st.header("📂 Project Control")
     if st.session_state.demo_mode:
-        st.warning("🎮 **Demo-Modus aktiv**")
+        st.warning("🎮 **Demo Mode active**")
 
-    all_projs = get_all_projects()
-    selected_proj = st.selectbox("Aktives Projekt:", all_projs)
+    all_projs     = get_all_projects()
+    selected_proj = st.selectbox("Active Project:", all_projs)
 
     st.divider()
     st.subheader("📈 Tracking")
-    do_history = st.checkbox("Messung in Zeitreihe ablegen", value=True)
+    do_history = st.checkbox("Save measurement to time series", value=True)
 
     with st.expander("🛠️ Admin, Export & Import"):
-        st.subheader("📋 Projekt-Verwaltung")
-        new_p = st.text_input("Neues Projekt / Kopie:")
-        if st.button("🚀 Erstellen", use_container_width=True):
+        st.subheader("📋 Project Management")
+        new_p = st.text_input("New Project / Copy:")
+        if st.button("🚀 Create", use_container_width=True):
             if new_p.strip():
                 save_data(new_p, load_tasks(selected_proj), load_risks(selected_proj))
-                st.session_state.toast_msg = f"Projekt '{new_p}' erstellt!"
+                st.session_state.toast_msg  = f"Project '{new_p}' created!"
                 st.session_state.toast_type = "success"
                 st.rerun()
             else:
-                st.session_state.toast_msg = "Projekt-Name erforderlich!"
+                st.session_state.toast_msg  = "Project name required!"
                 st.session_state.toast_type = "warning"
                 st.rerun()
 
         st.divider()
+        st.subheader("📤 Export")
+
+        # Simple export (tasks + risks only)
         t_exp = load_tasks(selected_proj)
         r_exp = load_risks(selected_proj)
-        export_payload = json.dumps({"project": selected_proj, "tasks": t_exp.to_dict(orient="records"), "risks": r_exp.to_dict(orient="records")}, indent=2)
-        st.download_button("📤 Projekt exportieren (JSON)", export_payload, f"{selected_proj}_export.json", use_container_width=True)
+        simple_payload = json.dumps({
+            "project": selected_proj,
+            "tasks":   t_exp.to_dict(orient="records"),
+            "risks":   r_exp.to_dict(orient="records")
+        }, indent=2)
+        st.download_button("📤 Export Tasks & Risks (JSON)",
+                           simple_payload,
+                           f"{selected_proj}_tasks_risks.json",
+                           use_container_width=True)
+
+        # Complete export (all data)
+        complete_payload = export_complete_project(selected_proj)
+        st.download_button("📦 Export Complete Project (JSON)",
+                           complete_payload,
+                           f"{selected_proj}_complete_{datetime.now().strftime('%Y%m%d')}.json",
+                           mime="application/json",
+                           use_container_width=True)
 
         st.divider()
-        st.subheader("🗑️ Daten bereinigen")
-        if st.button("📊 Historie löschen", use_container_width=True):
+        st.subheader("📥 Import")
+        uploaded = st.file_uploader("Import Project (JSON)", type="json")
+        if uploaded:
+            if st.button("📥 Import Project", use_container_width=True):
+                try:
+                    imp_name = import_complete_project(uploaded.read().decode("utf-8"))
+                    st.session_state.toast_msg  = f"Project '{imp_name}' imported!"
+                    st.session_state.toast_type = "success"
+                    st.rerun()
+                except Exception as e:
+                    st.session_state.toast_msg  = f"Import failed: {str(e)}"
+                    st.session_state.toast_type = "error"
+                    st.rerun()
+
+        st.divider()
+        st.subheader("🗑️ Clean Up")
+        if st.button("📊 Delete History", use_container_width=True):
             delete_history_only(selected_proj)
-            st.session_state.toast_msg = "Historie gelöscht."
+            st.session_state.toast_msg  = "History deleted."
             st.session_state.toast_type = "success"
             st.rerun()
 
         st.divider()
-        st.subheader("❗ Projekt löschen")
-        st.warning("⚠️ Nicht umkehrbar!")
-        confirm_del = st.checkbox(f"Löschen von '{selected_proj}' bestätigen")
-        if st.button(f"🗑️ {selected_proj} löschen", use_container_width=True, type="secondary"):
+        st.subheader("❗ Delete Project")
+        st.warning("⚠️ Irreversible!")
+        confirm_del = st.checkbox(f"Confirm deletion of '{selected_proj}'")
+        if st.button(f"🗑️ Delete {selected_proj}", use_container_width=True, type="secondary"):
             if confirm_del:
                 delete_project_complete(selected_proj)
-                st.session_state.toast_msg = f"Projekt '{selected_proj}' gelöscht."
+                st.session_state.toast_msg  = f"Project '{selected_proj}' deleted."
                 st.session_state.toast_type = "success"
                 st.rerun()
             else:
-                st.session_state.toast_msg = "Bestätigung erforderlich!"
+                st.session_state.toast_msg  = "Confirmation required!"
                 st.session_state.toast_type = "warning"
                 st.rerun()
 
     st.divider()
-    st.subheader("📊 Szenarien-Vergleich")
+    st.subheader("📊 Scenario Comparison")
     if st.session_state.snapshot_durations is not None and st.session_state.snapshot_date is not None:
-        st.success(f"✅ **Snapshot aktiv**\n\n📅 {st.session_state.snapshot_date.strftime('%d.%m.%Y')}")
-        if st.button("🗑️ Snapshot löschen", use_container_width=True, key="delete_snapshot"):
+        st.success(f"✅ **Snapshot active**\n\n📅 {st.session_state.snapshot_date.strftime('%d.%m.%Y')}")
+        if st.button("🗑️ Delete Snapshot", use_container_width=True, key="delete_snapshot"):
             st.session_state.snapshot_durations = None
-            st.session_state.snapshot_date = None
+            st.session_state.snapshot_date      = None
             st.rerun()
     else:
-        st.info("ℹ️ Kein Snapshot gespeichert.\n\nNach Simulation: '📸 Stand einfrieren' klicken.")
+        st.info("ℹ️ No snapshot saved.\n\nAfter simulation: click '📸 Freeze State'.")
 
     st.divider()
-    st.subheader("🏢 Globale Standards")
+    st.subheader("🏢 Global Standard Risks")
 
     if st.session_state.std_risk_df is None:
         st.session_state.std_risk_df = get_default_standard_risks_df()
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Alle an", use_container_width=True):
+        if st.button("All on", use_container_width=True):
             df_tmp = st.session_state.std_risk_df.copy()
-            df_tmp["Aktiv"] = True
+            df_tmp["Active"] = True
             st.session_state.std_risk_df = df_tmp
             st.rerun()
     with c2:
-        if st.button("Alle aus", use_container_width=True):
+        if st.button("All off", use_container_width=True):
             df_tmp = st.session_state.std_risk_df.copy()
-            df_tmp["Aktiv"] = False
+            df_tmp["Active"] = False
             st.session_state.std_risk_df = df_tmp
             st.rerun()
 
-    with st.expander("⚙️ Standardrisiken konfigurieren", expanded=False):
+    with st.expander("⚙️ Configure Standard Risks", expanded=False):
         edited_std = st.data_editor(
             st.session_state.std_risk_df,
-            use_container_width=True,
-            num_rows="dynamic",
-            key="std_risk_editor",
+            use_container_width=True, num_rows="dynamic", key="std_risk_editor",
             column_config={
-                "Aktiv":   st.column_config.CheckboxColumn("Aktiv"),
-                "name":    st.column_config.TextColumn("Risiko"),
-                "type":    st.column_config.SelectboxColumn("Typ", options=["Binär", "Kontinuierlich"], required=True),
-                "prob":    st.column_config.NumberColumn("Wahrsch.", min_value=0.0, max_value=1.0, step=0.01),
-                "min":     st.column_config.NumberColumn("Impact Min",    step=0.01),
-                "likely":  st.column_config.NumberColumn("Impact Likely", step=0.01),
-                "max":     st.column_config.NumberColumn("Impact Max",    step=0.01),
-            },
-        )
-        if st.button("💾 Übernehmen", use_container_width=True):
+                "Active": st.column_config.CheckboxColumn("Active"),
+                "name":   st.column_config.TextColumn("Risk"),
+                "type":   st.column_config.SelectboxColumn("Type", options=["Binary", "Continuous"], required=True),
+                "prob":   st.column_config.NumberColumn("Probability", min_value=0.0, max_value=1.0, step=0.01),
+                "min":    st.column_config.NumberColumn("Impact Min",    step=0.01),
+                "likely": st.column_config.NumberColumn("Impact Likely", step=0.01),
+                "max":    st.column_config.NumberColumn("Impact Max",    step=0.01),
+            })
+        if st.button("💾 Apply", use_container_width=True):
             df_tmp = edited_std.copy()
             df_tmp["prob"] = df_tmp["prob"].clip(0, 1)
             vals = np.sort(df_tmp[["min", "likely", "max"]].values, axis=1)
             df_tmp["min"], df_tmp["likely"], df_tmp["max"] = vals[:, 0], vals[:, 1], vals[:, 2]
             st.session_state.std_risk_df = df_tmp
-            st.success("✅ Standardrisiken aktualisiert.")
+            st.session_state.toast_msg   = "Standard risks updated."
+            st.session_state.toast_type  = "success"
+            st.rerun()
 
-    active_std_df = st.session_state.std_risk_df[st.session_state.std_risk_df["Aktiv"] == True].copy()
-    selected_std = active_std_df[["name", "type", "prob", "min", "likely", "max"]].to_dict(orient="records")
-    st.caption(f"Aktiv: {len(selected_std)} von {len(st.session_state.std_risk_df)}")
+    active_std_df = st.session_state.std_risk_df[st.session_state.std_risk_df["Active"] == True].copy()
+    selected_std  = active_std_df[["name", "type", "prob", "min", "likely", "max"]].to_dict(orient="records")
+    st.caption(f"Active: {len(selected_std)} of {len(st.session_state.std_risk_df)}")
 
     st.divider()
-    st.subheader("⚙️ Simulationsparameter")
-    n_sim = st.number_input("Durchläufe", min_value=1000, max_value=50000, value=10000, step=1000)
-    start_date = st.date_input("Projekt-Start", datetime.now())
-
-    # NEUE OPTION:
-    use_business_days = st.checkbox("📅 Werktage verwenden (Mo-Fr)", value=False, 
-                                 help="True = nur Montag-Freitag zählen\nFalse = alle Kalendertage")
+    st.subheader("⚙️ Simulation Parameters")
+    n_sim      = st.number_input("Runs", min_value=1000, max_value=50000, value=10000, step=1000)
+    start_date = st.date_input("Project Start", datetime.now())
+    use_business_days = st.checkbox("📅 Use Business Days (Mon–Fri)",
+                                    value=False,
+                                    help="True = Mon–Fri only, German holidays excluded")
 
 # --- 8. MAIN ---
-st.title(f"🎲 {selected_proj} | v{APP_VERSION}")
+st.title(f"🎲 {selected_proj} | Risk Sim Pro v{APP_VERSION}")
 
-# Toast-Feedback nach rerun anzeigen
+# Toast feedback after rerun
 if st.session_state.toast_msg:
     _icon = {"success": "✅", "error": "❌", "warning": "⚠️"}.get(
         st.session_state.toast_type, "ℹ️")
@@ -616,167 +626,111 @@ if st.session_state.toast_msg:
     st.session_state.toast_msg  = None
     st.session_state.toast_type = None
 
-st.info("📌 **Workflow:** 1️⃣ Tasks definieren & speichern → 2️⃣ Risiken konfigurieren → 3️⃣ Simulation starten")
+st.info("📌 **Workflow:** 1️⃣ Define & save tasks → 2️⃣ Configure risks → 3️⃣ Run simulation")
 
-# --- TEAMS (Vereinfacht) ---
+# --- TEAMS ---
 st.divider()
-st.subheader("👥 Team-Verwaltung")
-
-col_tm1, col_tm2 = st.columns([2, 1])
-with col_tm1:
-    st.info("💡 **Wie Teams funktionieren:**\n"
-            "- Tasks werden Teams zugewiesen\n"
-            "- Teams arbeiten **parallel** zueinander\n"
-            "- Capacity: 1.0 = normal, 2.0 = doppelte Geschwindigkeit\n"
-            "- Projekt endet wenn **längster Team** fertig ist (nicht Summe!)")
+st.subheader("👥 Team Management")
+st.info("💡 Tasks of the same team run **sequentially**, different teams run **in parallel**.\n"
+        "Capacity > 1.0 = faster (e.g. 2.0 = double speed).")
 
 tm_curr = load_teams(selected_proj)
-with col_tm2:
-    st.metric("📊 Teams aktiv", len(tm_curr))
-
-# Teams mit besserer Visualisierung
-st.subheader("Team-Struktur")
 col_a, col_b, col_c = st.columns(3)
 
 with col_a:
     st.write("**Team Name**")
-    team_names = st.data_editor(
-        tm_curr[["Team"]].reset_index(drop=True),
-        use_container_width=True,
-        num_rows="dynamic",
-        key=f"team_names_{selected_proj}",
-        hide_index=True
-    )
-
+    team_names = st.data_editor(tm_curr[["Team"]].reset_index(drop=True),
+                                use_container_width=True, num_rows="dynamic",
+                                key=f"team_names_{selected_proj}", hide_index=True)
 with col_b:
-    st.write("**Kapazität**")
+    st.write("**Capacity**")
     team_caps = st.data_editor(
         tm_curr[["Capacity"]].reset_index(drop=True),
-        use_container_width=True,
-        num_rows="dynamic",
-        key=f"team_caps_{selected_proj}",
+        use_container_width=True, num_rows="dynamic",
+        key=f"team_caps_{selected_proj}", hide_index=True,
         column_config={"Capacity": st.column_config.NumberColumn(
-            "Kapazität", min_value=0.1, max_value=5.0, step=0.1
-        )},
-        hide_index=True
-    )
-
+            "Capacity", min_value=0.1, max_value=5.0, step=0.1)})
 with col_c:
-    st.write("**Beispiele**")
-    st.markdown("""
-    - 0.5 = **Doppelt so langsam**
-    - 1.0 = **Normal**
-    - 2.0 = **Doppelt so schnell**
-    - 3.0 = **3x schneller**
-    """)
+    st.write("**Examples**")
+    st.markdown("- 0.5 = **2× slower**\n- 1.0 = **Normal**\n- 2.0 = **2× faster**\n- 3.0 = **3× faster**")
 
-# Merge & Save
 if not team_names.empty and not team_caps.empty:
-    ed_tm = pd.concat([
-        team_names.reset_index(drop=True),
-        team_caps.reset_index(drop=True)
-    ], axis=1)
-    
-    if st.button("💾 Teams speichern", use_container_width=True, key="save_teams"):
+    ed_tm = pd.concat([team_names.reset_index(drop=True),
+                       team_caps.reset_index(drop=True)], axis=1)
+    if st.button("💾 Save Teams", use_container_width=True, key="save_teams"):
         save_teams(selected_proj, ed_tm)
-        st.session_state.toast_msg  = "Teams gespeichert!"
+        st.session_state.toast_msg  = "Teams saved!"
         st.session_state.toast_type = "success"
         st.rerun()
 else:
-    # Fallback wenn leer
     ed_tm = tm_curr.copy()
-
-st.caption("💡 Capacity > 1.0 = schneller (z.B. 2.0 = doppeltes Tempo). Wird nicht verwendet, wenn leer.")
 
 # --- TASKS ---
 st.divider()
-st.subheader("📋 1. Projektstruktur (Tasks)")
-st.info("💡 **Parallel-Arbeit:** Ordne Tasks Teams zu. Tasks desselben Teams laufen sequenziell, Teams arbeiten parallel.")
-
+st.subheader("📋 1. Project Structure (Tasks)")
 t_curr = load_tasks(selected_proj)
 if "team" not in t_curr.columns:
-    t_curr.insert(len(t_curr.columns), "team", "Sequenziell")
+    t_curr.insert(len(t_curr.columns), "team", "Sequential")
 
-# Visuelle Vorschau
-st.write("**Aufgaben-Zuordnung**")
-tab_edit, tab_preview = st.tabs(["Bearbeiten", "Vorschau"])
+critical_path_calc = 0.0
+tab_edit, tab_preview = st.tabs(["Edit", "Critical Path Preview"])
 
 with tab_edit:
-    team_options = ["Sequenziell"] + ed_tm["Team"].tolist() if not ed_tm.empty else ["Sequenziell"]
-    
+    team_options = ["Sequential"] + ed_tm["Team"].tolist() if not ed_tm.empty else ["Sequential"]
     ed_t = st.data_editor(
-        t_curr,
-        use_container_width=True,
-        num_rows="dynamic",
-        key=f"t_{selected_proj}",
+        t_curr, use_container_width=True, num_rows="dynamic", key=f"t_{selected_proj}",
         column_config={
-            "Duration (Days)": st.column_config.NumberColumn(
-                "Dauer (Tage)", min_value=0.1, step=1.0
-            ),
-            "team": st.column_config.SelectboxColumn(
-                "Team zugewiesen", 
-                options=team_options,
-                help="Wähle Team für Parallelverarbeitung"
-            )
-        }
-    )
+            "Duration (Days)": st.column_config.NumberColumn("Duration (Days)", min_value=0.1, step=1.0),
+            "team": st.column_config.SelectboxColumn("Team", options=team_options,
+                                                      help="Assign team for parallel execution")
+        })
 
 with tab_preview:
-    # Zeige kritischen Pfad Berechnung
-    st.write("**Kritischer Pfad Berechnung**")
-    
+    st.write("**Critical Path Calculation**")
     if not ed_t.empty and "team" in ed_t.columns:
         team_breakdown = ed_t.groupby("team")["Duration (Days)"].sum().sort_values(ascending=False)
-        
         for team, duration in team_breakdown.items():
-            # Capacity anwenden
             capacity = 1.0
             if not ed_tm.empty:
                 team_row = ed_tm[ed_tm["Team"] == team]
                 if not team_row.empty:
                     capacity = float(team_row.iloc[0]["Capacity"])
-            
             effective = duration / capacity
-            
             col1, col2, col3, col4 = st.columns(4)
             col1.write(f"**{team}**")
-            col2.metric("Summe", f"{duration:.0f}d")
-            col3.metric("Kapazität", f"{capacity}x")
-            col4.metric("Effektiv", f"{effective:.1f}d", delta="CP" if effective == team_breakdown.max() / capacity else None)
-        
-        critical_path_calc = 0.0  # vor den Tabs initialisieren
-        for team in ed_t["team"].unique():
-            team_tasks = ed_t[ed_t["team"] == team]
-            team_sum = team_tasks["Duration (Days)"].sum()
-            
-            # Wende Team-Capacity an
-            if not ed_tm.empty:
-                team_row = ed_tm[ed_tm["Team"] == team]
-                if not team_row.empty:
-                    capacity = float(team_row.iloc[0].get("Capacity", 1.0))
-                    team_sum = team_sum / capacity  # Höhere Capacity = schneller
-            
-            critical_path_calc += team_sum
-    
-    st.success(f"✅ **Kritischer Pfad = {critical_path_calc:.1f} Tage** (nicht {ed_t['Duration (Days)'].sum():.0f}!)")
+            col2.metric("Sum", f"{duration:.0f}d")
+            col3.metric("Capacity", f"{capacity}x")
+            col4.metric("Effective", f"{effective:.1f}d")
 
-col_t1, col_t2 = st.columns([1, 1])
+        try:
+            critical_path_calc = max([
+                float(ed_t[ed_t["team"] == t]["Duration (Days)"].sum()) /
+                (float(ed_tm[ed_tm["Team"] == t]["Capacity"].iloc[0])
+                 if not ed_tm.empty and not ed_tm[ed_tm["Team"] == t].empty else 1.0)
+                for t in ed_t["team"].unique()
+            ])
+        except Exception:
+            critical_path_calc = float(ed_t["Duration (Days)"].sum())
+
+        st.success(f"✅ **Critical Path = {critical_path_calc:.1f} days** "
+                   f"(total sum would be: {ed_t['Duration (Days)'].sum():.0f} days)")
+
+col_t1, col_t2 = st.columns(2)
 with col_t1:
-    if st.button("💾 Tasks speichern", use_container_width=True):
+    if st.button("💾 Save Tasks", use_container_width=True):
         if "team" not in ed_t.columns:
-            ed_t["team"] = "Sequenziell"
-        ed_t["team"] = ed_t["team"].fillna("Sequenziell")
+            ed_t["team"] = "Sequential"
+        ed_t["team"] = ed_t["team"].fillna("Sequential")
         save_data(selected_proj, ed_t, load_risks(selected_proj))
-        st.session_state.toast_msg  = "Tasks gespeichert!"
+        st.session_state.toast_msg  = "Tasks saved!"
         st.session_state.toast_type = "success"
         st.rerun()
-
 with col_t2:
     st.info(f"📊 {len(ed_t)} Tasks | CP: {critical_path_calc:.0f}d")
 
 # --- RISKS ---
 st.divider()
-st.subheader("⚠️ 2. Risiko-Register")
+st.subheader("⚠️ 2. Risk Register")
 r_curr = load_risks(selected_proj)
 if "Effect" not in r_curr.columns:
     r_curr["Effect"] = "Threat"
@@ -786,72 +740,70 @@ t_opts = ["Global"] + t_curr["Task Name"].tolist()
 ed_r = st.data_editor(
     r_curr, use_container_width=True, num_rows="dynamic", key=f"r_{selected_proj}",
     column_config={
-        "Risk Type": st.column_config.SelectboxColumn("Logik", options=["Binär", "Kontinuierlich"], required=True),
-        "Target (Global/Task)": st.column_config.SelectboxColumn("Fokus", options=t_opts, required=True),
-        "Probability (0-1)": st.column_config.NumberColumn("Wahrscheinlichkeit", min_value=0.0, max_value=1.0, step=0.01),
-        "Effect": st.column_config.SelectboxColumn(         # NEU
-            "Wirkung", options=["Threat", "Opportunity"],
-            required=True,
-            help="Threat = verzögert | Opportunity = beschleunigt"
-        ),
-    }
-)
+        "Risk Type": st.column_config.SelectboxColumn("Logic", options=["Binary", "Continuous"], required=True),
+        "Target (Global/Task)": st.column_config.SelectboxColumn("Target", options=t_opts, required=True),
+        "Probability (0-1)": st.column_config.NumberColumn("Probability", min_value=0.0, max_value=1.0, step=0.01),
+        "Effect": st.column_config.SelectboxColumn(
+            "Effect", options=["Threat", "Opportunity"], required=True,
+            help="Threat = delays project | Opportunity = accelerates project"),
+    })
+
 col_r1, _, col_r3 = st.columns([1, 1, 2])
 with col_r1:
-    if st.button("💾 Risiken speichern", use_container_width=True):
+    if st.button("💾 Save Risks", use_container_width=True):
         save_data(selected_proj, ed_t, ed_r)
-        st.session_state.toast_msg  = "Risiken gespeichert!"
+        st.session_state.toast_msg  = "Risks saved!"
         st.session_state.toast_type = "success"
         st.rerun()
 with col_r3:
-    st.metric("Anzahl Risiken", len(ed_r))
+    st.metric("Total Risks", len(ed_r))
 
 # --- SIMULATION ---
 st.divider()
-if st.button("🚀 Simulation starten & Trend analysieren", use_container_width=True, type="primary"):
+if st.button("🚀 Run Simulation & Analyze Trends", use_container_width=True, type="primary"):
     try:
         if ed_t.empty or ed_t["Duration (Days)"].sum() <= 0:
-            st.error("❌ Keine gültigen Tasks definiert.")
+            st.error("❌ No valid tasks defined.")
             st.stop()
 
-        with st.spinner("⏳ Berechne Monte-Carlo Simulation..."):
-            # WICHTIG: ed_tm (Teams) mitübergeben!
+        with st.spinner("⏳ Running Monte-Carlo Simulation..."):
             durations, impact_df = run_fast_simulation(ed_t, ed_r, selected_std, ed_tm, n_sim)
-            
-            # --- WERKTAGE ODER KALENDERTAGE ---
+
             if use_business_days:
-                # Mit Feiertagen
                 end_dates = pd.Series([
-                    add_business_days_with_holidays(start_date, int(d)) for d in durations
-                ])
+                    add_business_days_with_holidays(start_date, int(d)) for d in durations])
             else:
-                # Standard: Kalendertage
-                start_np = np.datetime64(start_date)
-                end_dates = pd.to_datetime(start_np + durations.astype('timedelta64[D]'), errors='coerce')
-            
+                start_np  = np.datetime64(start_date)
+                end_dates = pd.to_datetime(
+                    start_np + durations.astype('timedelta64[D]'), errors='coerce')
+
             commit_85 = pd.Series(end_dates).quantile(0.85)
 
-            st.session_state.last_durations   = durations
-            st.session_state.last_impact_df   = impact_df
-            st.session_state.last_commit_85   = commit_85
-            st.session_state.last_end_dates   = end_dates
+            st.session_state.last_durations = durations
+            st.session_state.last_impact_df = impact_df
+            st.session_state.last_commit_85 = commit_85
+            st.session_state.last_end_dates = end_dates
 
-            history_df = load_history(selected_proj)
-            diff, warning_msg, rec = 0, "✅ Erste Messung", "Projekt befindet sich im Plan."
+            history_df  = load_history(selected_proj)
+            diff        = 0
+            warning_msg = "✅ First measurement"
+            rec         = "Project is on track."
 
             if not history_df.empty:
                 try:
                     last_date = pd.to_datetime(history_df.iloc[-1]['target_date'])
                     diff = (commit_85 - last_date).days
                     if diff > 0:
-                        warning_msg = f"⚠️ TERMINWARNUNG: Verzögerung um {diff} Tage!"
-                        rec = "🚨 Stakeholder informieren & Mitigation-Plan aktivieren."
+                        warning_msg = f"⚠️ DEADLINE WARNING: Delay of {diff} days!"
+                        rec = "🚨 Inform stakeholders & activate mitigation plan."
                     elif diff < 0:
-                        warning_msg = f"✨ POSITIVER TREND: Verbesserung um {abs(diff)} Tage."
+                        warning_msg = f"✨ POSITIVE TREND: Improvement of {abs(diff)} days."
                 except Exception:
                     pass
 
-            top_r = impact_df.sort_values("Verzögerung", ascending=False).iloc[0]["Quelle"] if not impact_df.empty else "N/A"
+            top_r = (impact_df.sort_values("Delay", ascending=False).iloc[0]["Source"]
+                     if not impact_df.empty else "N/A")
+
             st.session_state.last_top_r       = top_r
             st.session_state.last_diff        = diff
             st.session_state.last_warning_msg = warning_msg
@@ -859,7 +811,8 @@ if st.button("🚀 Simulation starten & Trend analysieren", use_container_width=
             st.session_state.last_history_df  = history_df
 
             if do_history:
-                save_history(selected_proj, commit_85.strftime('%Y-%m-%d'), float(np.mean(durations)), top_r)
+                save_history(selected_proj, commit_85.strftime('%Y-%m-%d'),
+                             float(np.mean(durations)), top_r)
                 st.session_state.last_history_df = load_history(selected_proj)
 
             if "⚠️" in warning_msg:
@@ -868,7 +821,7 @@ if st.button("🚀 Simulation starten & Trend analysieren", use_container_width=
                 st.success(warning_msg)
             else:
                 st.success(warning_msg)
-            st.info(f"**Anweisung:** {rec}")
+            st.info(f"**Recommendation:** {rec}")
 
     except ValueError as e:
         st.error(f"❌ {str(e)}")
@@ -877,7 +830,7 @@ if st.button("🚀 Simulation starten & Trend analysieren", use_container_width=
         with st.expander("🔧 Debug"):
             st.code(traceback.format_exc())
 
-# --- ERGEBNISANZEIGE ---
+# --- RESULTS ---
 if st.session_state.last_durations is not None:
     durations   = st.session_state.last_durations
     impact_df   = st.session_state.last_impact_df
@@ -890,475 +843,515 @@ if st.session_state.last_durations is not None:
     history_df  = st.session_state.last_history_df
     start_np    = np.datetime64(start_date)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Überblick", "🔥 Risk-Analyse", "📈 Trends", "📜 Report", "📊 Validierung"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📊 Overview", "🔥 Risk Analysis", "📈 Trends", "📜 Report", "📊 Validation"])
 
     with tab1:
-        st.subheader("Kernkennzahlen & Verteilung")
-        col_metric1, col_metric2, col_metric3 = st.columns(3)
-        with col_metric1:
-            st.metric("🎯 Zieltermin (85%)", commit_85.strftime('%d.%m.%Y'),
-                      delta=f"{diff} Tage" if not history_df.empty else None, delta_color="inverse")
-        with col_metric2:
-            st.metric("📦 Pufferbedarf (Ø)", f"{int(np.mean(durations) - ed_t['Duration (Days)'].sum())} Tage")
-        with col_metric3:
-            st.metric("📊 Min - Max", f"{int(np.min(durations))} - {int(np.max(durations))} Tage")
+        st.subheader("Key Metrics & Distribution")
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("🎯 Target Date (P85)", commit_85.strftime('%d.%m.%Y'),
+                      delta=f"{diff} days" if history_df is not None and not history_df.empty else None,
+                      delta_color="inverse")
+        col_m2.metric("📦 Buffer Required (Avg)",
+                      f"{int(np.mean(durations) - ed_t['Duration (Days)'].sum())} days")
+        col_m3.metric("📊 Min – Max",
+                      f"{int(np.min(durations))} – {int(np.max(durations))} days")
 
         st.divider()
         col_chart, col_top = st.columns([2, 1])
 
         with col_chart:
-            st.subheader("Verteilung der Projektenddaten")
+            st.subheader("Distribution of Project End Dates")
             fig = go.Figure()
-            fig.add_trace(go.Histogram(x=end_dates, name="Aktuell", marker_color="#1f77b4", opacity=0.7, nbinsx=40))
-
+            fig.add_trace(go.Histogram(x=end_dates, name="Current",
+                                       marker_color="#1f77b4", opacity=0.7, nbinsx=40))
             if st.session_state.snapshot_durations is not None:
-                ref_ends = pd.to_datetime(start_np + st.session_state.snapshot_durations.astype('timedelta64[D]'), errors='coerce')
-                fig.add_trace(go.Histogram(x=ref_ends, name="Referenz (alt)", marker_color="#a0a0a0", opacity=0.5, nbinsx=40))
-                fig.add_vline(x=st.session_state.snapshot_date.timestamp()*1000, line_dash="dash", line_color="#707070",
+                ref_ends = pd.to_datetime(
+                    start_np + st.session_state.snapshot_durations.astype('timedelta64[D]'),
+                    errors='coerce')
+                fig.add_trace(go.Histogram(x=ref_ends, name="Reference (old)",
+                                           marker_color="#a0a0a0", opacity=0.5, nbinsx=40))
+                fig.add_vline(x=st.session_state.snapshot_date.timestamp() * 1000,
+                              line_dash="dash", line_color="#707070",
                               annotation_text=f"Ref: {st.session_state.snapshot_date.strftime('%d.%m.%Y')}")
-
-            fig.add_vline(x=commit_85.timestamp()*1000, line_dash="solid", line_color="#d62728",
-                          annotation_text=f"Ziel: {commit_85.strftime('%d.%m.%Y')}")
+            fig.add_vline(x=commit_85.timestamp() * 1000, line_dash="solid", line_color="#d62728",
+                          annotation_text=f"Target: {commit_85.strftime('%d.%m.%Y')}")
             fig.update_layout(template="plotly_white", barmode='overlay', height=450,
-                              xaxis_title="Enddatum", yaxis_title="Häufigkeit",
-                              legend=dict(bgcolor="rgba(255,255,255,0.8)", bordercolor="black", borderwidth=1))
+                              xaxis_title="End Date", yaxis_title="Frequency")
             st.plotly_chart(fig, use_container_width=True)
 
         with col_top:
-            st.subheader("🔥 Top Risiko-Treiber")
-            if st.button("📸 Stand einfrieren", use_container_width=True, key="freeze_snapshot"):
+            st.subheader("🔥 Top Risk Driver")
+            if st.button("📸 Freeze State", use_container_width=True, key="freeze_snapshot"):
                 st.session_state.snapshot_durations = durations.copy()
-                st.session_state.snapshot_date = commit_85
-                st.success("✅ Snapshot gespeichert!")
+                st.session_state.snapshot_date      = commit_85
+                st.session_state.toast_msg  = "Snapshot saved!"
+                st.session_state.toast_type = "success"
+                st.rerun()
             st.divider()
             st.markdown(f"### {top_r}")
             if not impact_df.empty:
-                top_delay = impact_df.sort_values("Verzögerung", ascending=False).iloc[0]["Verzögerung"]
-                st.write(f"**Ø Verzögerung:** {top_delay:.1f} Tage")
+                top_delay = impact_df.sort_values("Delay", ascending=False).iloc[0]["Delay"]
+                st.write(f"**Avg Delay:** {top_delay:.1f} days")
 
     with tab2:
-        st.subheader("Risiko Impact Overview (Tornado Chart)")
-        if not impact_df.empty:
-            impact_df_sorted = impact_df.sort_values("Verzögerung", ascending=True).copy()
-            if "Effect" not in impact_df_sorted.columns:
-                impact_df_sorted["Effect"] = "Threat"
+        st.subheader("Risk Impact Overview")
 
-            colors = impact_df_sorted["Effect"].map({
-                "Threat": "#EF553B",
-                "Opportunity": "#2ECC71"
+        if not impact_df.empty:
+            # --- Summary metrics ---
+            opp_mask    = impact_df["Effect"] == "Opportunity"
+            threat_days = impact_df.loc[~opp_mask, "Delay"].sum()
+            opp_days    = abs(impact_df.loc[opp_mask, "Delay"].sum())
+            net_days    = threat_days - opp_days
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("⚠️ Threat Impact",      f"{threat_days:.1f} days")
+            c2.metric("🚀 Opportunity Impact", f"{opp_days:.1f} days")
+            c3.metric("📊 Net Impact",          f"{net_days:.1f} days", delta_color="inverse")
+
+            st.divider()
+
+            # --- Tornado chart coloured by Effect ---
+            sorted_df = impact_df.sort_values("Delay", ascending=True).copy()
+            colors = sorted_df["Effect"].map({
+                "Threat":      "#EF553B",   # red
+                "Opportunity": "#2ECC71"    # green
             }).fillna("#636EFA")
 
             fig_tornado = go.Figure(go.Bar(
-                x=impact_df_sorted["Verzögerung"],
-                y=impact_df_sorted["Quelle"],
+                x=sorted_df["Delay"],
+                y=sorted_df["Source"],
                 orientation="h",
                 marker_color=colors,
-                text=impact_df_sorted["Verzögerung"].round(1),
-                textposition="auto"
+                text=sorted_df["Delay"].apply(lambda v: f"{v:+.1f}d"),
+                textposition="outside",
+                customdata=sorted_df["Effect"],
+                hovertemplate="<b>%{y}</b><br>Delay: %{x:.1f}d<br>Effect: %{customdata}<extra></extra>"
             ))
-            fig_tornado.update_layout(template="plotly_white", xaxis_title="Ø Verzögerung in Tagen",
-                                      height=max(400, len(impact_df_sorted)*40), margin=dict(l=250))
+            fig_tornado.add_vline(x=0, line_color="black", line_width=1)
+            fig_tornado.update_layout(
+                title="Tornado Chart  🔴 Threat  |  🟢 Opportunity",
+                xaxis_title="Avg Delay (days)",
+                template="plotly_white",
+                height=max(350, len(sorted_df) * 38),
+                margin=dict(l=250))
             st.plotly_chart(fig_tornado, use_container_width=True)
+
             st.divider()
-            st.subheader("Detaillierte Risiko-Rankings")
-            impact_display = impact_df.sort_values("Verzögerung", ascending=False).copy()
-            impact_display["Verzögerung"] = impact_display["Verzögerung"].round(2)
-            st.dataframe(impact_display, use_container_width=True, hide_index=True)
+
+            # --- Separate tables for Threats and Opportunities ---
+            col_thr, col_opp = st.columns(2)
+
+            with col_thr:
+                st.markdown("### ⚠️ Threats")
+                threats_df = (impact_df[~opp_mask]
+                              .sort_values("Delay", ascending=False)
+                              .copy())
+                threats_df["Delay"] = threats_df["Delay"].round(2)
+                st.dataframe(threats_df[["Source", "Delay", "Type", "Team"]],
+                             use_container_width=True, hide_index=True)
+
+            with col_opp:
+                st.markdown("### 🚀 Opportunities")
+                opps_df = (impact_df[opp_mask]
+                           .sort_values("Delay", ascending=True)
+                           .copy())
+                opps_df["Delay"] = opps_df["Delay"].round(2)
+                if not opps_df.empty:
+                    st.dataframe(opps_df[["Source", "Delay", "Type", "Team"]],
+                                 use_container_width=True, hide_index=True)
+                else:
+                    st.info("No opportunities defined.")
         else:
-            st.info("ℹ️ Keine Risiken definiert.")
+            st.info("ℹ️ No risks defined or simulation not yet run.")
 
     with tab3:
-        if not history_df.empty and len(history_df) > 1:
-            st.subheader("📉 Fieberkurve")
-            history_df_local = history_df.copy()
-            history_df_local['target_date_dt'] = pd.to_datetime(history_df_local['target_date'])
+        st.subheader("📈 Time Series Trend")
+        if history_df is not None and not history_df.empty:
             fig_trend = go.Figure()
             fig_trend.add_trace(go.Scatter(
-                x=history_df_local['timestamp'], y=history_df_local['target_date_dt'],
-                mode='lines+markers', line=dict(color='firebrick', width=3),
-                fill='tozeroy', fillcolor='rgba(255,0,0,0.1)', marker=dict(size=8)
-            ))
-            fig_trend.update_layout(template="plotly_white", yaxis_title="Prognostizierter Zieltermin",
-                                    xaxis_title="Messzeitpunkt", height=400)
+                x=history_df["timestamp"],
+                y=pd.to_datetime(history_df["target_date"]),
+                mode="lines+markers", name="Target Date (P85)",
+                line=dict(color="#1f77b4", width=2), marker=dict(size=8)))
+            fig_trend.update_layout(title="Target Date Development Over Time",
+                                    xaxis_title="Measurement Point",
+                                    yaxis_title="Target Date",
+                                    template="plotly_white", height=400)
             st.plotly_chart(fig_trend, use_container_width=True)
+
             st.divider()
-            st.subheader("Mess-Historie")
-            history_display = history_df_local.copy()
-            history_display['target_date'] = pd.to_datetime(history_display['target_date']).dt.strftime('%d.%m.%Y')
-            history_display['buffer'] = history_display['buffer'].round(1)
-            st.dataframe(history_display, use_container_width=True, hide_index=True)
+            dates = pd.to_datetime(history_df["target_date"])
+            c1, c2, c3 = st.columns(3)
+            c1.metric("📅 Earliest Date",  dates.min().strftime('%d.%m.%Y'))
+            c2.metric("📅 Latest Date",    dates.max().strftime('%d.%m.%Y'))
+            c3.metric("📊 Total Measurements", len(history_df))
+
+            drift = (dates.iloc[-1] - dates.iloc[0]).days
+            st.metric("📈 Total Drift (first vs. last)", f"{drift:+} days", delta_color="inverse")
+
+            st.divider()
+            st.subheader("📋 Measurement History")
+            st.dataframe(history_df.sort_values("timestamp", ascending=False),
+                         use_container_width=True, hide_index=True)
         else:
-            st.info("ℹ️ Mindestens 2 Messungen nötig für Trend-Visualisierung.")
+            st.info("ℹ️ No history data. Run simulation with tracking enabled.")
 
     with tab4:
         st.subheader("📜 Management Report")
-        task_list_str = "".join([f"- {row['Task Name']}: {row['Duration (Days)']} Tage\n" for _, row in ed_t.iterrows()])
-        risk_list_str = "".join([f"- {row['Risk Name']} ({row['Risk Type']}): {row['Probability (0-1)']} P\n" for _, row in ed_r.iterrows()])
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🎯 Target Date (P85)", commit_85.strftime('%d.%m.%Y'))
+        c2.metric("⏱️ Avg Duration",      f"{int(np.mean(durations))} days")
+        c3.metric("📊 Min / Max",         f"{int(np.min(durations))} / {int(np.max(durations))} days")
+        c4.metric("🔁 Simulation Runs",   f"{n_sim:,}")
+
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("👥 Teams",  len(tm_curr))
+        c2.metric("📋 Tasks",  len(t_curr))
+        c3.metric("⚠️ Risks",  len(r_curr))
+
+        if not impact_df.empty:
+            opp_mask    = impact_df["Effect"] == "Opportunity"
+            threat_days = impact_df.loc[~opp_mask, "Delay"].sum()
+            opp_days    = abs(impact_df.loc[opp_mask, "Delay"].sum())
+            net_days    = threat_days - opp_days
+
+            st.divider()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("⚠️ Threat Impact",      f"{threat_days:.1f} days")
+            c2.metric("🚀 Opportunity Impact", f"{opp_days:.1f} days")
+            c3.metric("📊 Net Impact",          f"{net_days:.1f} days")
+
+            st.write("**Top 5 Risks:**")
+            top5 = (impact_df.sort_values("Delay", ascending=False)
+                    .head(5)[["Source", "Delay", "Team", "Effect"]]
+                    .reset_index(drop=True))
+            top5["Delay"] = top5["Delay"].round(2)
+            st.dataframe(top5, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.write("**Percentiles:**")
+        pcts     = [50, 70, 80, 85, 90, 95]
+        pct_data = []
+        for pc in pcts:
+            d  = int(np.percentile(durations, pc))
+            ed = (add_business_days_with_holidays(start_date, d)
+                  if use_business_days
+                  else pd.to_datetime(np.datetime64(start_date) + np.timedelta64(d, 'D')))
+            pct_data.append({"Percentile": f"P{pc}", "Days": d,
+                             "End Date": ed.strftime('%d.%m.%Y')})
+        st.dataframe(pd.DataFrame(pct_data), use_container_width=True, hide_index=True)
+
+        st.divider()
         impact_ranking_str = ""
         if not impact_df.empty:
-            ranked = impact_df.sort_values("Verzögerung", ascending=False)
-            impact_ranking_str = "".join([f"- {row['Quelle']}: ~{row['Verzögerung']:.1f} Tage\n" for _, row in ranked.iterrows()])
+            for _, row in impact_df.sort_values("Delay", ascending=False).iterrows():
+                impact_ranking_str += f"- {row['Source']} ({row['Effect']}): ~{row['Delay']:.1f} days\n"
 
-        hist_report_df = history_df.tail(10).copy()
-        try:
-            hist_report_df['timestamp'] = pd.to_datetime(hist_report_df['timestamp']).dt.strftime('%d.%m.%Y %H:%M')
-        except Exception:
-            pass
+        report_txt = f"""MONTE-CARLO REPORT – {selected_proj}
+Created: {datetime.now().strftime('%d.%m.%Y %H:%M')} | Version: {APP_VERSION}
+{'='*55}
+STATUS:         {warning_msg}
+RECOMMENDATION: {rec}
 
-        report_content = f"""MANAGEMENT TREND & RISK REPORT - {selected_proj}
-Erstellt am: {datetime.now().strftime('%d.%m.%Y %H:%M')} | Version: {APP_VERSION}
----------------------------------------------------------
-STATUS: {warning_msg}
-EMPFEHLUNG: {rec}
+KEY METRICS
+  Target Date (P85) : {commit_85.strftime('%d.%m.%Y')}
+  Avg Duration      : {int(np.mean(durations))} days
+  Buffer Required   : {int(np.mean(durations) - ed_t['Duration (Days)'].sum())} days
+  Min / Max         : {int(np.min(durations))} / {int(np.max(durations))} days
 
-KENNZAHLEN:
-- Zieltermin (85%): {commit_85.strftime('%d.%m.%Y')}
-- Ø Projektdauer: {np.mean(durations):.1f} Tage
-- Risiko-Puffer: {int(np.mean(durations) - ed_t['Duration (Days)'].sum())} Tage
-- Min / Max: {int(np.min(durations))} / {int(np.max(durations))} Tage
+RISK DRIVERS
+{impact_ranking_str or "  None defined"}
 
-RISIKO-TREIBER:
-{impact_ranking_str or "- Keine Risiken definiert"}
+STRUCTURE
+  Teams  : {len(tm_curr)}
+  Tasks  : {len(t_curr)}
+  Risks  : {len(r_curr)}
 
-TASKS:
-{task_list_str or "- Keine Tasks"}
+SIMULATION PARAMETERS
+  Runs       : {n_sim:,}
+  Start Date : {start_date.strftime('%d.%m.%Y')}
+  Std. Risks : {len(selected_std)} / {len(st.session_state.std_risk_df)} active
+""".strip()
 
-RISIKEN:
-{risk_list_str or "- Keine Risiken"}
-
-HISTORIE (letzte 10):
-{hist_report_df.to_string(index=False) if not hist_report_df.empty else "- Keine Daten"}
-
-Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%Y')} | Std-Risiken aktiv: {len(selected_std)}/{len(st.session_state.std_risk_df)}
-"""
-        st.text_area("Report Vorschau", report_content, height=400, disabled=True, key="report_preview")
-        st.download_button("📥 Report exportieren (.txt)", report_content,
+        st.text_area("Report Preview", report_txt, height=350, disabled=True)
+        st.download_button("📥 Download Report (.txt)", report_txt,
                            f"Report_{selected_proj}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
                            use_container_width=True)
 
     with tab5:
-        st.subheader("📊 Risiko-Validierung (Backtesting)")
-        
+        st.subheader("📊 Risk Validation (Backtesting)")
         actual_df = load_actual_results(selected_proj)
-        
+
         if not actual_df.empty:
-            actual_df["planned_days_int"] = actual_df["planned_duration"].astype(int)
-            actual_df["actual_days_int"] = actual_df["actual_duration"].astype(int)
-            actual_df["abweichung_prozent"] = ((actual_df["actual_duration"] - actual_df["planned_duration"]) / actual_df["planned_duration"] * 100).round(1)
-            
-            # 1. Genauigkeit der 85%-Prognose
-            st.write("### 🎯 85%-Prognose-Genauigkeit")
-            correct_predictions = 0
-            total = len(actual_df)
-            
-            for _, row in actual_df.iterrows():
-                if row["actual_duration"] <= row["planned_duration"] * 1.15:
-                    correct_predictions += 1
-            
-            accuracy = (correct_predictions / total * 100) if total > 0 else 0
-            col_acc1, col_acc2, col_acc3 = st.columns(3)
-            with col_acc1:
-                st.metric("✅ Vorhersage-Accuracy", f"{accuracy:.1f}%", 
-                          delta="Gut" if accuracy > 75 else "Überprüfen", 
-                          delta_color="normal" if accuracy > 75 else "inverse")  # "bad" → "inverse"
-            with col_acc2:
-                st.metric("📊 Projekte erfasst", total)
-            with col_acc3:
-                st.metric("✓ Prognose korrekt", int(correct_predictions))
-            
-            # 2. Häufigste eingetretene Risiken (inkl. Threat/Opportunity)
+            actual_df["planned_days_int"]   = actual_df["planned_duration"].astype(int)
+            actual_df["actual_days_int"]    = actual_df["actual_duration"].astype(int)
+            actual_df["deviation_pct"]      = (
+                (actual_df["actual_duration"] - actual_df["planned_duration"])
+                / actual_df["planned_duration"] * 100).round(1)
+
+            # 1. Forecast accuracy
+            st.write("### 🎯 P85 Forecast Accuracy")
+            correct = sum(1 for _, row in actual_df.iterrows()
+                          if row["actual_duration"] <= row["planned_duration"] * 1.15)
+            total    = len(actual_df)
+            accuracy = (correct / total * 100) if total > 0 else 0
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("✅ Forecast Accuracy", f"{accuracy:.1f}%",
+                      delta="Good" if accuracy > 75 else "Review",
+                      delta_color="normal" if accuracy > 75 else "inverse")
+            c2.metric("📊 Projects Recorded", total)
+            c3.metric("✓ Correct Forecasts",  correct)
+
+            # 2. Risks breakdown — Threats vs Opportunities
             st.divider()
-            st.write("### 🔥 Häufigste eingetretene Risiken")
+            st.write("### 🔥 Occurred Risks — Threat vs Opportunity")
 
-            # Effect-Lookup aus aktuellem Register + Standardrisiken
             effect_lookup = _build_effect_lookup(ed_r, selected_std)
-
             risk_rows = []
             for risks_json in actual_df["risks_occurred"]:
                 if not risks_json:
                     continue
                 try:
                     items = json.loads(risks_json)
-                    if isinstance(items, list):
-                        for item in items:
-                            # NEU: unterstützt {"name": "...", "effect": "..."} und altes "name"-Format
-                            if isinstance(item, dict):
-                                name = str(item.get("name", "")).strip()
-                                raw_eff = str(item.get("effect", "")).strip()
-                                eff = "Opportunity" if raw_eff.casefold() == "opportunity" else (
-                                    effect_lookup.get(_norm_risk_name(name), "Threat")
-                                )
-                            else:
-                                name = str(item).strip()
-                                eff = effect_lookup.get(_norm_risk_name(name), "Threat")
-
-                            if name:
-                                risk_rows.append({"Risk": name, "Effect": eff})
+                    if not isinstance(items, list):
+                        continue
+                    for item in items:
+                        if isinstance(item, dict):
+                            name    = str(item.get("name", "")).strip()
+                            raw_eff = str(item.get("effect", "")).strip()
+                            eff     = "Opportunity" if raw_eff.casefold() == "opportunity" else \
+                                      effect_lookup.get(_norm_risk_name(name), "Threat")
+                        else:
+                            name = str(item).strip()
+                            eff  = effect_lookup.get(_norm_risk_name(name), "Threat")
+                        if name:
+                            risk_rows.append({"Risk": name, "Effect": eff})
                 except json.JSONDecodeError:
                     pass
 
             if risk_rows:
-                risk_df = pd.DataFrame(risk_rows)
-                opp_mask = risk_df["Effect"].astype(str).str.casefold().eq("opportunity")
-                threat_hits = int((~opp_mask).sum())
-                opp_hits = int(opp_mask.sum())
-                c_rt1, c_rt2 = st.columns(2)
-                c_rt1.metric("⚠️ Threat-Eintritte", threat_hits)
-                c_rt2.metric("🚀 Opportunity-Eintritte", opp_hits)
+                risk_df  = pd.DataFrame(risk_rows)
+                opp_mask = risk_df["Effect"].str.casefold() == "opportunity"
 
-                # Aggregation pro Risk + Effect
-                risk_counts = (
-                    risk_df.groupby(["Risk", "Effect"])
-                    .size()
-                    .reset_index(name="Count")
-                    .sort_values("Count", ascending=True)
-                )
+                c1, c2 = st.columns(2)
+                c1.metric("⚠️ Threat Occurrences",      int((~opp_mask).sum()))
+                c2.metric("🚀 Opportunity Occurrences", int(opp_mask.sum()))
+
+                risk_counts = (risk_df.groupby(["Risk", "Effect"])
+                               .size().reset_index(name="Count")
+                               .sort_values("Count", ascending=True))
 
                 colors = risk_counts["Effect"].map({
-                    "Threat": "#EF553B",
+                    "Threat":      "#EF553B",
                     "Opportunity": "#2ECC71"
                 }).fillna("#636EFA")
 
                 fig_risk = go.Figure(go.Bar(
-                    x=risk_counts["Count"],
-                    y=risk_counts["Risk"],
-                    orientation='h',
-                    marker_color=colors,
-                    text=risk_counts["Count"],
-                    textposition='auto',
+                    x=risk_counts["Count"], y=risk_counts["Risk"],
+                    orientation='h', marker_color=colors,
+                    text=risk_counts["Count"], textposition='auto',
                     customdata=risk_counts["Effect"],
-                    hovertemplate="<b>%{y}</b><br>Count: %{x}<br>Effect: %{customdata}<extra></extra>"
-                ))
-                fig_risk.update_layout(
-                    template="plotly_white",
-                    xaxis_title="Häufigkeit",
-                    height=max(300, len(risk_counts) * 40),
-                    margin=dict(l=200)
-                )
+                    hovertemplate="<b>%{y}</b><br>Count: %{x}<br>Effect: %{customdata}<extra></extra>"))
+                fig_risk.update_layout(template="plotly_white", xaxis_title="Frequency",
+                                       height=max(300, len(risk_counts) * 40), margin=dict(l=200))
                 st.plotly_chart(fig_risk, use_container_width=True)
+
+                # Separate tables
+                col_thr, col_opp = st.columns(2)
+                with col_thr:
+                    st.markdown("#### ⚠️ Threats occurred")
+                    thr_tbl = (risk_counts[risk_counts["Effect"] == "Threat"]
+                               .sort_values("Count", ascending=False)
+                               .reset_index(drop=True))
+                    st.dataframe(thr_tbl[["Risk", "Count"]], use_container_width=True, hide_index=True)
+                with col_opp:
+                    st.markdown("#### 🚀 Opportunities occurred")
+                    opp_tbl = (risk_counts[risk_counts["Effect"] == "Opportunity"]
+                               .sort_values("Count", ascending=False)
+                               .reset_index(drop=True))
+                    if not opp_tbl.empty:
+                        st.dataframe(opp_tbl[["Risk", "Count"]], use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No opportunities recorded yet.")
             else:
-                st.info("ℹ️ Noch keine Risiken dokumentiert.")
-            
-            # 3. Abweichungs-Trend
+                st.info("ℹ️ No risks documented yet.")
+
+            # 3. Deviation trend
             st.divider()
-            st.write("### 📈 Abweichungs-Trend")
-            
-            fig_deviation = go.Figure()
-            fig_deviation.add_trace(go.Scatter(
-                x=actual_df.index,
-                y=actual_df["abweichung_prozent"],
-                mode='lines+markers',
-                fill='tozeroy',
-                fillcolor='rgba(239, 85, 59, 0.2)',
-                line=dict(color='#EF553B', width=3),
-                marker=dict(size=8),
-                name='Abweichung (%)'
-            ))
-            fig_deviation.add_hline(y=0, line_dash="dash", line_color="green", 
-                                    annotation_text="Plan", annotation_position="right")
-            fig_deviation.add_hline(y=15, line_dash="dot", line_color="orange",
-                                    annotation_text="85% Ziel", annotation_position="right")
-            fig_deviation.update_layout(
-                template="plotly_white",
-                yaxis_title="Abweichung (%)",
-                xaxis_title="Projekt-Nummer",
-                height=400
-            )
-            st.plotly_chart(fig_deviation, use_container_width=True)
-            
-            # 4. Kalibrierungs-Empfehlungen
+            st.write("### 📈 Deviation Trend")
+            fig_dev = go.Figure()
+            fig_dev.add_trace(go.Scatter(
+                x=actual_df.index, y=actual_df["deviation_pct"],
+                mode='lines+markers', fill='tozeroy',
+                fillcolor='rgba(239,85,59,0.2)',
+                line=dict(color='#EF553B', width=3), marker=dict(size=8),
+                name='Deviation (%)'))
+            fig_dev.add_hline(y=0,  line_dash="dash", line_color="green",
+                              annotation_text="Plan",    annotation_position="right")
+            fig_dev.add_hline(y=15, line_dash="dot",  line_color="orange",
+                              annotation_text="P85 Target", annotation_position="right")
+            fig_dev.update_layout(template="plotly_white",
+                                  yaxis_title="Deviation (%)", xaxis_title="Project #",
+                                  height=400)
+            st.plotly_chart(fig_dev, use_container_width=True)
+
+            # 4. Calibration recommendations
             st.divider()
-            st.write("### 🔧 Kalibrierungs-Empfehlungen")
-            
-            avg_deviation = actual_df["abweichung_prozent"].mean()
-            std_deviation = actual_df["abweichung_prozent"].std()
-            
-            col_rec1, col_rec2 = st.columns(2)
-            with col_rec1:
-                st.metric("Ø Abweichung", f"{avg_deviation:+.1f}%")
-            with col_rec2:
-                st.metric("Std. Abweichung", f"{std_deviation:.1f}%")
-            
+            st.write("### 🔧 Calibration Recommendations")
+            avg_dev = actual_df["deviation_pct"].mean()
+            std_dev = actual_df["deviation_pct"].std()
+
+            c1, c2 = st.columns(2)
+            c1.metric("Avg Deviation", f"{avg_dev:+.1f}%")
+            c2.metric("Std Deviation", f"{std_dev:.1f}%")
             st.divider()
-            
-            if avg_deviation > 15:
+
+            if avg_dev > 15:
                 st.warning(
-                    f"⚠️ **Zu optimistisch geplant** (Ø +{avg_deviation:.1f}%)\n\n"
-                    "**Empfehlung:**\n"
-                    "- Standard-Risiko-Parameter um ~10-15% erhöhen\n"
-                    "- Insbesondere: Erhöhen Sie Impact-Spannen bei kontinuierlichen Risiken\n"
-                    "- Überprüfen Sie, ob neue Standardrisiken fehlen"
-                )
-            elif avg_deviation < -10:
+                    f"⚠️ **Too optimistic** (avg {avg_dev:+.1f}%)\n\n"
+                    "**Recommendation:**\n"
+                    "- Increase standard risk parameters by ~10–15%\n"
+                    "- Widen impact ranges for continuous risks\n"
+                    "- Check if new standard risks are missing")
+            elif avg_dev < -10:
                 st.info(
-                    f"ℹ️ **Zu pessimistisch geplant** (Ø {avg_deviation:.1f}%)\n\n"
-                    "**Empfehlung:**\n"
-                    "- Standard-Risiko-Parameter um ~5-10% reduzieren\n"
-                    "- Überprüfen Sie Wahrscheinlichkeiten (sind sie zu hoch?)\n"
-                    "- Deaktivieren Sie möglicherweise nicht-relevante Risiken"
-                )
+                    f"ℹ️ **Too pessimistic** (avg {avg_dev:.1f}%)\n\n"
+                    "**Recommendation:**\n"
+                    "- Reduce standard risk parameters by ~5–10%\n"
+                    "- Review probabilities (are they too high?)\n"
+                    "- Deactivate non-relevant risks")
             else:
                 st.success(
-                    f"✅ **Sehr gut geplant** (Ø {avg_deviation:+.1f}%)\n\n"
-                    "Ihre Risiko-Parameter sind gut kalibriert. Weiterhin monatlich überprüfen."
-                )
-            
-            # 5. Detaillierte Tabelle
+                    f"✅ **Well calibrated** (avg {avg_dev:+.1f}%)\n\n"
+                    "Your risk parameters are well calibrated. Review monthly.")
+
+            # 5. Detail table
             st.divider()
-            st.write("### 📋 Alle erfassten Projektergebnisse")
-            
-            display_df = actual_df[[
-                "start_date", "planned_end_date", "actual_end_date", 
-                "planned_days_int", "actual_days_int", "abweichung_prozent", "notes"
+            st.write("### 📋 All Recorded Project Results")
+            disp = actual_df[[
+                "start_date", "planned_end_date", "actual_end_date",
+                "planned_days_int", "actual_days_int", "deviation_pct", "notes"
             ]].copy()
-            display_df.columns = [
-                "Start", "Geplant", "Tatsächlich", 
-                "Plan (Tage)", "Actual (Tage)", "Abw. (%)", "Notizen"
-            ]
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-            
+            disp.columns = ["Start", "Planned", "Actual",
+                            "Plan (days)", "Actual (days)", "Dev. (%)", "Notes"]
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
         else:
             st.info(
-                "ℹ️ **Noch keine Projektergebnisse erfasst.**\n\n"
-                "**So funktioniert Backtesting:**\n"
-                "1. Nach Projekt-Abschluss das Formular unten ausfüllen\n"
-                "2. Mindestens 3-5 Projekte sammeln\n"
-                "3. Dieser Tab zeigt dann automatisch Validierungsergebnisse\n\n"
-                "Mit echten Daten können Sie die Risiko-Parameter kontinuierlich verbessern!"
-            )
+                "ℹ️ **No project results recorded yet.**\n\n"
+                "**How backtesting works:**\n"
+                "1. Fill in the form below after project completion\n"
+                "2. Collect at least 3–5 projects\n"
+                "3. This tab will automatically show validation results\n\n"
+                "With real data you can continuously improve your risk parameters!")
 
-    # --- ALTES FORMULAR KOMPLETT LÖSCHEN ---
-    # Das folgende expander-Block ENTFERNEN:
-    # with st.expander("✅ Projekt-Abschluss dokumentieren", expanded=False):
-    #     ...
-
-    # --- NUR DIESES FORMULAR BEHALTEN ---
+    # --- RECORD PROJECT PROGRESS ---
     st.divider()
-    with st.expander("✅ Projektverlauf dokumentieren", expanded=False):
-        
-        erfassungs_modus = st.radio(
-            "Erfassungs-Typ:",
-            ["📅 Zwischenstand (laufend)", "🏁 Projektabschluss (final)"],
-            horizontal=True,
-            key="erfassungs_modus"
-        )
+    with st.expander("✅ Record Project Progress", expanded=False):
 
-        actual_start = st.date_input("Start-Datum", start_date, key="proj_actual_start")
+        mode = st.radio("Entry Type:",
+                        ["📅 Interim Status (ongoing)", "🏁 Project Completion (final)"],
+                        horizontal=True, key="erfassungs_modus")
 
-        if erfassungs_modus == "📅 Zwischenstand (laufend)":
-            st.subheader("📅 Laufender Zwischenstand")
+        actual_start = st.date_input("Start Date", start_date, key="proj_actual_start")
+
+        if mode == "📅 Interim Status (ongoing)":
+            st.subheader("📅 Interim Status")
             col_zw1, col_zw2 = st.columns(2)
             with col_zw1:
-                stand_datum = st.date_input("Stand-Datum (heute)", datetime.now(), key="stand_datum")
+                stand_datum = st.date_input("Status Date (today)", datetime.now(), key="stand_datum")
             with col_zw2:
-                fertig_prozent = st.slider("Fertigstellungsgrad (%)", 0, 100, 50, key="fertig_prozent")
+                fertig_prozent = st.slider("Completion (%)", 0, 100, 50, key="fertig_prozent")
 
             tatsaechliche_tage_bisher = (stand_datum - actual_start).days
-            geplante_tage_bisher = ed_t["Duration (Days)"].sum() * (fertig_prozent / 100)
+            geplante_tage_bisher      = ed_t["Duration (Days)"].sum() * (fertig_prozent / 100)
 
-            col_info1, col_info2 = st.columns(2)
-            with col_info1:
-                st.metric("Tage bisher (tatsächlich)", tatsaechliche_tage_bisher)
-            with col_info2:
+            col_i1, col_i2 = st.columns(2)
+            with col_i1:
+                st.metric("Days elapsed (actual)", tatsaechliche_tage_bisher)
+            with col_i2:
                 if geplante_tage_bisher > 0:
                     velocity = geplante_tage_bisher / max(tatsaechliche_tage_bisher, 1)
                     st.metric("Velocity (Plan/Actual)", f"{velocity:.2f}",
-                              delta="Im Plan" if velocity >= 0.9 else "Verzögert",
+                              delta="On track" if velocity >= 0.9 else "Delayed",
                               delta_color="normal" if velocity >= 0.9 else "inverse")
 
             risiken_jetzt = st.multiselect(
-                "Aktuell aktive / eingetretene Risiken:",
+                "Currently active / occurred risks:",
                 options=ed_r["Risk Name"].tolist() + [sr["name"] for sr in selected_std],
-                key="risiken_zwischenstand"
-            )
-            notiz_zwischen = st.text_area("Notiz zum Zwischenstand", key="notiz_zwischen", height=80)
+                key="risiken_zwischenstand")
+            notiz_zwischen = st.text_area("Note", key="notiz_zwischen", height=80)
 
-            if st.button("💾 Zwischenstand speichern", use_container_width=True):
+            if st.button("💾 Save Interim Status", use_container_width=True):
                 try:
-                    if geplante_tage_bisher > 0 and velocity > 0:
-                        projected_total_days = int(ed_t["Duration (Days)"].sum() / velocity)
-                    else:
-                        projected_total_days = int(ed_t["Duration (Days)"].sum() * 2)
+                    velocity = (geplante_tage_bisher / max(tatsaechliche_tage_bisher, 1)
+                                if geplante_tage_bisher > 0 else 0)
+                    projected_total_days = (int(ed_t["Duration (Days)"].sum() / velocity)
+                                            if velocity > 0 else int(ed_t["Duration (Days)"].sum() * 2))
                     projected_end = actual_start + pd.Timedelta(days=projected_total_days)
 
-                    # FIX: commit_85 kann date oder datetime sein
                     c85 = st.session_state.last_commit_85
-                    planned_end_str = (
-                        c85.strftime('%Y-%m-%d')
-                        if c85 is not None and hasattr(c85, 'strftime')
-                        else str(projected_end.date()
-                                 if hasattr(projected_end, 'date')
-                                 else projected_end)
-                    )
+                    planned_end_str = (c85.strftime('%Y-%m-%d')
+                                       if c85 is not None and hasattr(c85, 'strftime')
+                                       else str(projected_end.date()
+                                                if hasattr(projected_end, 'date')
+                                                else projected_end))
 
-                    effect_lookup_live = _build_effect_lookup(ed_r, selected_std)
-                    risks_payload = [
-                        {
-                            "name": str(rn).strip(),
-                            "effect": effect_lookup_live.get(_norm_risk_name(rn), "Threat")
-                        }
-                        for rn in risiken_jetzt
-                    ]
+                    eff_lkp       = _build_effect_lookup(ed_r, selected_std)
+                    risks_payload = [{"name": str(rn).strip(),
+                                      "effect": eff_lkp.get(_norm_risk_name(rn), "Threat")}
+                                     for rn in risiken_jetzt]
 
                     save_actual_result(
-                        selected_proj,
-                        str(actual_start),
-                        planned_end_str,
+                        selected_proj, str(actual_start), planned_end_str,
                         str(projected_end.date() if hasattr(projected_end, 'date') else projected_end),
                         str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
-                        risks_payload,  # statt risiken_jetzt
-                        f"[ZWISCHENSTAND {fertig_prozent}%] {notiz_zwischen}"
-                    )
-                    st.session_state.toast_msg  = f"Zwischenstand ({fertig_prozent}%) gespeichert!"
+                        risks_payload,
+                        f"[INTERIM {fertig_prozent}%] {notiz_zwischen}")
+                    st.session_state.toast_msg  = f"Interim status ({fertig_prozent}%) saved!"
                     st.session_state.toast_type = "success"
                     st.rerun()
                 except Exception as e:
-                    st.session_state.toast_msg  = f"Fehler: {str(e)}"
+                    st.session_state.toast_msg  = f"Error: {str(e)}"
                     st.session_state.toast_type = "error"
                     st.rerun()
+
         else:
-            st.subheader("🏁 Projektabschluss")
-            actual_end_final = st.date_input("Tatsächliches End-Datum", key="actual_end_final")
+            st.subheader("🏁 Project Completion")
+            actual_end_final = st.date_input("Actual End Date", key="actual_end_final")
             all_risk_options = ed_r["Risk Name"].tolist() + [sr["name"] for sr in selected_std]
             risks_that_occurred = st.multiselect(
-                "Eingetretene Risiken (gesamt):",
-                options=all_risk_options if all_risk_options else ["Keine"],
-                key="risks_occurred_final"
-            )
+                "Risks that occurred (total):",
+                options=all_risk_options if all_risk_options else ["None"],
+                key="risks_occurred_final")
             actual_notes = st.text_area("Lessons Learned", key="actual_notes_final", height=100)
 
-            if st.button("💾 Projektabschluss speichern", use_container_width=True, type="primary"):
+            if st.button("💾 Save Project Completion", use_container_width=True, type="primary"):
                 try:
-                    # FIX: commit_85 kann date oder datetime sein
                     c85 = st.session_state.last_commit_85
-                    planned_end_str = (
-                        c85.strftime('%Y-%m-%d')
-                        if c85 is not None and hasattr(c85, 'strftime')
-                        else str(actual_end_final)
-                    )
+                    planned_end_str = (c85.strftime('%Y-%m-%d')
+                                       if c85 is not None and hasattr(c85, 'strftime')
+                                       else str(actual_end_final))
 
-                    effect_lookup_live = _build_effect_lookup(ed_r, selected_std)
-                    risks_payload = [
-                        {
-                            "name": str(rn).strip(),
-                            "effect": effect_lookup_live.get(_norm_risk_name(rn), "Threat")
-                        }
-                        for rn in risks_that_occurred
-                    ]
+                    eff_lkp       = _build_effect_lookup(ed_r, selected_std)
+                    risks_payload = [{"name": str(rn).strip(),
+                                      "effect": eff_lkp.get(_norm_risk_name(rn), "Threat")}
+                                     for rn in risks_that_occurred]
 
                     save_actual_result(
-                        selected_proj,
-                        str(actual_start),
-                        planned_end_str,
+                        selected_proj, str(actual_start), planned_end_str,
                         str(actual_end_final),
                         str(st.session_state.last_top_r) if st.session_state.last_top_r else "N/A",
-                        risks_payload,  # statt risks_that_occurred
-                        f"[ABSCHLUSS] {actual_notes}"
-                    )
-                    st.session_state.toast_msg  = "Projektabschluss gespeichert!"
+                        risks_payload,
+                        f"[COMPLETION] {actual_notes}")
+                    st.session_state.toast_msg  = "Project completion saved!"
                     st.session_state.toast_type = "success"
                     st.rerun()
                 except Exception as e:
-                    st.session_state.toast_msg  = f"Fehler beim Speichern: {str(e)}"
+                    st.session_state.toast_msg  = f"Save error: {str(e)}"
                     st.session_state.toast_type = "error"
                     st.rerun()
