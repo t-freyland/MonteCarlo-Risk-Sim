@@ -20,6 +20,7 @@ for key in [
     "last_end_dates", "last_top_r", "last_diff",
     "last_warning_msg", "last_rec", "last_history_df",
     "demo_mode", "std_risk_df",
+    "toast_msg", "toast_type",   # NEU
 ]:
     if key not in st.session_state:
         st.session_state[key] = None
@@ -630,7 +631,8 @@ if not team_names.empty and not team_caps.empty:
     
     if st.button("💾 Teams speichern", use_container_width=True, key="save_teams"):
         save_teams(selected_proj, ed_tm)
-        st.success("✅ Teams aktualisiert!")
+        st.session_state.toast_msg  = "Teams gespeichert!"
+        st.session_state.toast_type = "success"
         st.rerun()
 else:
     # Fallback wenn leer
@@ -709,7 +711,8 @@ with col_t1:
             ed_t["team"] = "Sequenziell"
         ed_t["team"] = ed_t["team"].fillna("Sequenziell")
         save_data(selected_proj, ed_t, load_risks(selected_proj))
-        st.success("✅ Tasks gespeichert!")
+        st.session_state.toast_msg  = "Tasks gespeichert!"
+        st.session_state.toast_type = "success"
         st.rerun()
 
 with col_t2:
@@ -741,7 +744,8 @@ col_r1, _, col_r3 = st.columns([1, 1, 2])
 with col_r1:
     if st.button("💾 Risiken speichern", use_container_width=True):
         save_data(selected_proj, ed_t, ed_r)
-        st.success("✅ Risiken gespeichert!")
+        st.session_state.toast_msg  = "Risiken gespeichert!"
+        st.session_state.toast_type = "success"
         st.rerun()
 with col_r3:
     st.metric("Anzahl Risiken", len(ed_r))
@@ -1188,11 +1192,13 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
                         risiken_jetzt,
                         f"[ZWISCHENSTAND {fertig_prozent}%] {notiz_zwischen}"
                     )
-                    st.success(f"✅ Zwischenstand gespeichert!")
+                    st.session_state.toast_msg  = f"Zwischenstand ({fertig_prozent}%) gespeichert!"
+                    st.session_state.toast_type = "success"
                     st.rerun()
                 except Exception as e:
-                    st.error(f"❌ Fehler: {str(e)}")
-
+                    st.session_state.toast_msg  = f"Fehler: {str(e)}"
+                    st.session_state.toast_type = "error"
+                    st.rerun()
         else:
             st.subheader("🏁 Projektabschluss")
             actual_end_final = st.date_input("Tatsächliches End-Datum", key="actual_end_final")
@@ -1223,7 +1229,10 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
                         risks_that_occurred,
                         f"[ABSCHLUSS] {actual_notes}"
                     )
-                    st.success("✅ Projektabschluss gespeichert!")
+                    st.session_state.toast_msg  = "Projektabschluss gespeichert!"
+                    st.session_state.toast_type = "success"
                     st.rerun()
                 except Exception as e:
-                    st.error(f"❌ Fehler beim Speichern: {str(e)}")
+                    st.session_state.toast_msg  = f"Fehler beim Speichern: {str(e)}"
+                    st.session_state.toast_type = "error"
+                    st.rerun()
