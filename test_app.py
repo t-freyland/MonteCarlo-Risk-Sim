@@ -16,7 +16,7 @@ def get_test_db_connection():
 def init_test_db():
     conn = get_test_db_connection()
     conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, task_name TEXT, duration REAL, description TEXT, team TEXT, sequence INTEGER)")
-    conn.execute("CREATE TABLE IF NOT EXISTS risks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, risk_name TEXT, risk_type TEXT, target TEXT, prob REAL, impact_min REAL, impact_likely REAL, impact_max REAL, mitigation TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS risks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, risk_name TEXT, risk_type TEXT, target TEXT, prob REAL, impact_min REAL, impact_likely REAL, impact_max REAL, mitigation TEXT, effect TEXT DEFAULT 'Threat')")
     conn.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, timestamp TEXT, target_date TEXT, buffer REAL, top_risk TEXT)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS actual_results (
@@ -107,10 +107,10 @@ class TestDatabase:
     def _save_risks(self, project, risks_df):
         conn = get_test_db_connection()
         for _, row in risks_df.iterrows():
-            conn.execute("INSERT INTO risks (project, risk_name, risk_type, target, prob, impact_min, impact_likely, impact_max, mitigation) VALUES (?,?,?,?,?,?,?,?,?)",
+            conn.execute("INSERT INTO risks (project, risk_name, risk_type, target, prob, impact_min, impact_likely, impact_max, mitigation, effect) VALUES (?,?,?,?,?,?,?,?,?,?)",
                          (project, row["Risk Name"], row["Risk Type"], row["Target (Global/Task)"],
                           row["Probability (0-1)"], row["Impact Min"], row["Impact Likely"], row["Impact Max"],
-                          row.get("Maßnahme / Mitigation", "")))
+                          row.get("Maßnahme / Mitigation", ""), row.get("Effect", "Threat")))
         conn.commit()
         conn.close()
 
@@ -313,6 +313,9 @@ class TestSimulation:
             p = float(r.get("Probability (0-1)", 0))
             rtype = str(r.get("Risk Type", "Binär")).strip().lower()
             target = str(r.get("Target (Global/Task)", "Global")).strip()
+            effect = str(r.get("Effect", "Threat")).strip().lower()
+            direction = -1.0 if effect == "opportunity" else 1.0
+
             mins = float(r.get("Impact Min", 0))
             lik = float(r.get("Impact Likely", mins))
             maxv = float(r.get("Impact Max", lik))
@@ -341,11 +344,13 @@ class TestSimulation:
                 continue
 
             delay = impacts * relevant_dur
-            total_days += delay if rtype == "kontinuierlich" else (hits * delay)
-            avg_delay = float(delay.mean()) if rtype == "kontinuierlich" else float((hits * delay).mean())
+            applied = (delay if rtype == "kontinuierlich" else (hits * delay)) * direction
+            total_days += applied
+            avg_delay = float(applied.mean())
+
             impact_results.append({
-                "Quelle": str(r["Risk Name"]), 
-                "Verzögerung": avg_delay, 
+                "Quelle": str(r["Risk Name"]),
+                "Verzögerung": avg_delay,   # Opportunity => negativ
                 "Typ": "Projekt",
                 "Team": task_team
             })
@@ -546,3 +551,45 @@ class TestSimulation:
         # Ergebnis: 20 + 4 = 24
         assert np.mean(durations) == pytest.approx(24.0, abs=1.0)
         assert impact_df.iloc[0]["Verzögerung"] == pytest.approx(4.0, abs=0.5)
+
+    def test_opportunity_reduces_duration(self, sample_tasks, sample_teams):
+        np.random.seed(42)
+        opp = pd.DataFrame([{
+            "Risk Name": "AI Boost",
+            "Risk Type": "Kontinuierlich",
+            "Target (Global/Task)": "Global",
+            "Probability (0-1)": 1.0,
+            "Impact Min": 0.10,
+            "Impact Likely": 0.10,
+            "Impact Max": 0.10,
+            "Effect": "Opportunity",
+            "Maßnahme / Mitigation": ""
+        }])
+
+        durations, impact_df = self.run_simulation(sample_tasks, opp, [], sample_teams, n=300)
+        # sample_tasks + sample_teams => kritischer Pfad 30
+        assert np.mean(durations) < 30
+        assert (impact_df["Verzögerung"] < 0).any()
+
+    def test_opportunity_never_below_zero_after_clipping(self):
+        tasks = pd.DataFrame([{
+            "Task Name": "Short",
+            "Duration (Days)": 1.0,
+            "Beschreibung": "",
+            "team": "A"
+        }])
+        teams = pd.DataFrame([{"Team": "A", "Capacity": 1.0}])
+        opp = pd.DataFrame([{
+            "Risk Name": "Huge Boost",
+            "Risk Type": "Kontinuierlich",
+            "Target (Global/Task)": "Global",
+            "Probability (0-1)": 1.0,
+            "Impact Min": 10.0,
+            "Impact Likely": 10.0,
+            "Impact Max": 10.0,
+            "Effect": "Opportunity",
+            "Maßnahme / Mitigation": ""
+        }])
+
+        durations, _ = self.run_simulation(tasks, opp, [], teams, n=100)
+        assert durations.min() >= 0

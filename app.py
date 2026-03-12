@@ -6,7 +6,6 @@ import json
 import traceback
 from datetime import datetime
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
 
 # --- 1. SETUP & CONFIG ---
 APP_VERSION = "2.5.0"  # Updated mit Backtesting-Funktionen
@@ -32,33 +31,29 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, task_name TEXT, duration REAL, description TEXT, team TEXT, sequence INTEGER)")
-    conn.execute("CREATE TABLE IF NOT EXISTS risks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, risk_name TEXT, risk_type TEXT, target TEXT, prob REAL, impact_min REAL, impact_likely REAL, impact_max REAL, mitigation TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS risks (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, risk_name TEXT, risk_type TEXT, target TEXT, prob REAL, impact_min REAL, impact_likely REAL, impact_max REAL, mitigation TEXT, effect TEXT DEFAULT 'Threat')")
     conn.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, timestamp TEXT, target_date TEXT, buffer REAL, top_risk TEXT)")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS actual_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project TEXT,
-            start_date TEXT,
-            planned_end_date TEXT,
-            actual_end_date TEXT,
-            planned_duration REAL,
-            actual_duration REAL,
-            buffer_used REAL,
-            top_risk TEXT,
-            risks_occurred TEXT,
-            notes TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS teams (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project TEXT,
-            team_name TEXT,
-            capacity REAL DEFAULT 1.0
-        )
-    """)
+    conn.execute("""CREATE TABLE IF NOT EXISTS actual_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, start_date TEXT,
+            planned_end_date TEXT, actual_end_date TEXT, planned_duration REAL,
+            actual_duration REAL, buffer_used REAL, top_risk TEXT, risks_occurred TEXT, notes TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT,
+            team_name TEXT, capacity REAL DEFAULT 1.0)""")
+
+    # Migration — HIER noch VOR commit/close
+    for sql in [
+        "ALTER TABLE risks ADD COLUMN effect TEXT DEFAULT 'Threat'",
+        "ALTER TABLE tasks ADD COLUMN team TEXT DEFAULT 'Sequenziell'",
+        "ALTER TABLE tasks ADD COLUMN sequence INTEGER DEFAULT 0",
+    ]:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass
+
     conn.commit()
-    conn.close()
+    conn.close()   # NUR EINMAL schließen
 
 init_db()
 
@@ -75,17 +70,36 @@ def get_all_projects():
 def load_tasks(project):
     """Lade alle Tasks für ein Projekt."""
     conn = get_db_connection()
-    df = pd.read_sql("SELECT task_name as 'Task Name', duration as 'Duration (Days)', description as 'Beschreibung' FROM tasks WHERE project=?", conn, params=(project,))
+    cols = pd.read_sql("PRAGMA table_info(tasks)", conn)["name"].tolist()
+    has_team = "team" in cols
+    q = """
+        SELECT task_name as 'Task Name', duration as 'Duration (Days)',
+               description as 'Beschreibung',
+               {} as 'team'
+        FROM tasks WHERE project=? ORDER BY id
+    """.format("COALESCE(team, 'Sequenziell')" if has_team else "'Sequenziell'")
+    df = pd.read_sql(q, conn, params=(project,))
     conn.close()
     if df.empty:
-        df = pd.DataFrame([{"Task Name": "Basis-Task", "Duration (Days)": 10.0, "Beschreibung": ""}])
+        df = pd.DataFrame([{"Task Name": "Basis-Task", "Duration (Days)": 10.0,
+                            "Beschreibung": "", "team": "Sequenziell"}])
     return df.reset_index(drop=True)
 
 def load_risks(project):
     """Lade alle Risiken für ein Projekt."""
     conn = get_db_connection()
-    df = pd.read_sql("SELECT risk_name as 'Risk Name', risk_type as 'Risk Type', target as 'Target (Global/Task)', prob as 'Probability (0-1)', impact_min as 'Impact Min', impact_likely as 'Impact Likely', impact_max as 'Impact Max', mitigation as 'Maßnahme / Mitigation' FROM risks WHERE project=?", conn, params=(project,))
+    df = pd.read_sql("""
+        SELECT risk_name as 'Risk Name', risk_type as 'Risk Type',
+               target as 'Target (Global/Task)', prob as 'Probability (0-1)',
+               impact_min as 'Impact Min', impact_likely as 'Impact Likely',
+               impact_max as 'Impact Max', mitigation as 'Maßnahme / Mitigation',
+               COALESCE(effect, 'Threat') as 'Effect'
+        FROM risks WHERE project=?
+    """, conn, params=(project,))
     conn.close()
+    if "Effect" not in df.columns:
+        df["Effect"] = "Threat"
+    df["Effect"] = df["Effect"].fillna("Threat")
     return df.reset_index(drop=True)
 
 def save_data(project, df_tasks, df_risks):
@@ -93,14 +107,18 @@ def save_data(project, df_tasks, df_risks):
     conn = get_db_connection()
     conn.execute("DELETE FROM tasks WHERE project=?", (project,))
     conn.execute("DELETE FROM risks WHERE project=?", (project,))
-    for _, row in df_tasks.iterrows():
+    for idx, row in df_tasks.iterrows():
         task_name = str(row.get("Task Name", "")).strip()
         if task_name:
             try:
                 duration = float(row["Duration (Days)"])
                 if duration > 0:
-                    conn.execute("INSERT INTO tasks (project, task_name, duration, description) VALUES (?,?,?,?)",
-                                 (project, task_name, duration, str(row.get("Beschreibung", ""))))
+                    conn.execute(
+                        "INSERT INTO tasks (project, task_name, duration, description, team, sequence) VALUES (?,?,?,?,?,?)",
+                        (project, task_name, duration,
+                         str(row.get("Beschreibung", "")),
+                         str(row.get("team", "Sequenziell")),  # team speichern
+                         int(idx)))
             except (ValueError, TypeError):
                 pass
     for _, row in df_risks.iterrows():
@@ -109,13 +127,18 @@ def save_data(project, df_tasks, df_risks):
             try:
                 prob = float(row.get("Probability (0-1)", 0))
                 if 0 <= prob <= 1:
-                    conn.execute("INSERT INTO risks (project, risk_name, risk_type, target, prob, impact_min, impact_likely, impact_max, mitigation) VALUES (?,?,?,?,?,?,?,?,?)",
-                                 (project, risk_name, str(row.get("Risk Type", "Binär")),
-                                  str(row.get("Target (Global/Task)", "Global")),
-                                  prob, float(row.get("Impact Min", 0)),
-                                  float(row.get("Impact Likely", 0)),
-                                  float(row.get("Impact Max", 0)),
-                                  str(row.get("Maßnahme / Mitigation", ""))))
+                    conn.execute("""
+                        INSERT INTO risks 
+                        (project, risk_name, risk_type, target, prob,
+                         impact_min, impact_likely, impact_max, mitigation, effect)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """, (project, risk_name, str(row.get("Risk Type", "Binär")),
+                          str(row.get("Target (Global/Task)", "Global")),
+                          prob, float(row.get("Impact Min", 0)),
+                          float(row.get("Impact Likely", 0)),
+                          float(row.get("Impact Max", 0)),
+                          str(row.get("Maßnahme / Mitigation", "")),
+                          str(row.get("Effect", "Threat"))))  # effect ergänzt
             except (ValueError, TypeError):
                 pass
     conn.commit()
@@ -330,12 +353,16 @@ def run_fast_simulation(tasks, risks, std_risks, teams, n):
         p = float(r.get("Probability (0-1)", 0))
         rtype = str(r.get("Risk Type", "Binär")).strip().lower()
         target = str(r.get("Target (Global/Task)", "Global")).strip()
+        effect = str(r.get("Effect", "Threat")).strip().lower()       # NEU
+        direction = -1.0 if effect == "opportunity" else 1.0          # NEU
+        task_team = "Global"
+
         mins = float(r.get("Impact Min", 0))
-        lik = float(r.get("Impact Likely", mins))
+        lik  = float(r.get("Impact Likely", mins))
         maxv = float(r.get("Impact Max", lik))
-        
+
         impacts = np.random.triangular(mins, lik, max(maxv, lik + 1e-6), size=n)
-        hits = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
+        hits    = np.ones(n, dtype=bool) if rtype == "kontinuierlich" else (np.random.random(n) < p)
 
         # Bestimme betroffene Dauer
         if target.lower() == "global":
@@ -360,15 +387,16 @@ def run_fast_simulation(tasks, risks, std_risks, teams, n):
             continue
 
         # Addiere Risiko-Verzögerung zum kritischen Pfad
-        delay = impacts * relevant_dur
-        total_days += delay if rtype == "kontinuierlich" else (hits * delay)
-        
-        avg_delay = float(delay.mean()) if rtype == "kontinuierlich" else float((hits * delay).mean())
+        delay   = impacts * relevant_dur
+        applied = (delay if rtype == "kontinuierlich" else hits * delay) * direction  # direction anwenden
+        total_days += applied
+
         impact_results.append({
-            "Quelle": str(r["Risk Name"]), 
-            "Verzögerung": avg_delay, 
-            "Typ": "Projekt",
-            "Team": task_team if target.lower() != "global" else "Global"
+            "Quelle":      str(r.get("Risk Name", "Unbekannt")),
+            "Verzögerung": float(applied.mean()),
+            "Typ":         "Projekt",
+            "Team":        task_team,
+            "Effect":      "Opportunity" if direction < 0 else "Threat"  # NEU
         })
 
     # --- STANDARD-RISIKEN ---
@@ -691,6 +719,10 @@ with col_t2:
 st.divider()
 st.subheader("⚠️ 2. Risiko-Register")
 r_curr = load_risks(selected_proj)
+if "Effect" not in r_curr.columns:
+    r_curr["Effect"] = "Threat"
+r_curr["Effect"] = r_curr["Effect"].fillna("Threat")
+
 t_opts = ["Global"] + t_curr["Task Name"].tolist()
 ed_r = st.data_editor(
     r_curr, use_container_width=True, num_rows="dynamic", key=f"r_{selected_proj}",
@@ -698,6 +730,11 @@ ed_r = st.data_editor(
         "Risk Type": st.column_config.SelectboxColumn("Logik", options=["Binär", "Kontinuierlich"], required=True),
         "Target (Global/Task)": st.column_config.SelectboxColumn("Fokus", options=t_opts, required=True),
         "Probability (0-1)": st.column_config.NumberColumn("Wahrscheinlichkeit", min_value=0.0, max_value=1.0, step=0.01),
+        "Effect": st.column_config.SelectboxColumn(         # NEU
+            "Wirkung", options=["Threat", "Opportunity"],
+            required=True,
+            help="Threat = verzögert | Opportunity = beschleunigt"
+        ),
     }
 )
 col_r1, _, col_r3 = st.columns([1, 1, 2])
