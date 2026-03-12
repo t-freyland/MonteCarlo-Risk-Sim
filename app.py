@@ -664,135 +664,166 @@ if st.session_state.toast_msg:
 
 st.info("📌 **Workflow:** 1️⃣ Define & save tasks → 2️⃣ Configure risks → 3️⃣ Run simulation")
 
-# --- TEAMS ---
+# --- EDITOR TABS (TOP AREA) ---
 st.divider()
-st.subheader("👥 Team Management")
-st.info("💡 Tasks of the same team run **sequentially**, different teams run **in parallel**.\n"
-        "Capacity > 1.0 = faster (e.g. 2.0 = double speed).")
+tab_team_mgmt, tab_project_structure, tab_risk_register = st.tabs(
+    ["👥 Team Management", "📋 Project Structure", "⚠️ Risk Register"]
+)
 
+# preload
 tm_curr = load_teams(selected_proj)
-col_a, col_b, col_c = st.columns(3)
-
-with col_a:
-    st.write("**Team Name**")
-    team_names = st.data_editor(tm_curr[["Team"]].reset_index(drop=True),
-                                use_container_width=True, num_rows="dynamic",
-                                key=f"team_names_{selected_proj}", hide_index=True)
-with col_b:
-    st.write("**Capacity**")
-    team_caps = st.data_editor(
-        tm_curr[["Capacity"]].reset_index(drop=True),
-        use_container_width=True, num_rows="dynamic",
-        key=f"team_caps_{selected_proj}", hide_index=True,
-        column_config={"Capacity": st.column_config.NumberColumn(
-            "Capacity", min_value=0.1, max_value=5.0, step=0.1)})
-with col_c:
-    st.write("**Examples**")
-    st.markdown("- 0.5 = **2× slower**\n- 1.0 = **Normal**\n- 2.0 = **2× faster**\n- 3.0 = **3× faster**")
-
-if not team_names.empty and not team_caps.empty:
-    ed_tm = pd.concat([team_names.reset_index(drop=True),
-                       team_caps.reset_index(drop=True)], axis=1)
-    if st.button("💾 Save Teams", use_container_width=True, key="save_teams"):
-        save_teams(selected_proj, ed_tm)
-        st.session_state.toast_msg  = "Teams saved!"
-        st.session_state.toast_type = "success"
-        st.rerun()
-else:
-    ed_tm = tm_curr.copy()
-
-# --- TASKS ---
-st.divider()
-st.subheader("📋 1. Project Structure (Tasks)")
 t_curr = load_tasks(selected_proj)
+r_curr = load_risks(selected_proj)
+
 if "team" not in t_curr.columns:
     t_curr.insert(len(t_curr.columns), "team", "Sequential")
-
-critical_path_calc = 0.0
-tab_edit, tab_preview = st.tabs(["Edit", "Critical Path Preview"])
-
-with tab_edit:
-    team_options = ["Sequential"] + ed_tm["Team"].tolist() if not ed_tm.empty else ["Sequential"]
-    ed_t = st.data_editor(
-        t_curr, use_container_width=True, num_rows="dynamic", key=f"t_{selected_proj}",
-        column_config={
-            "Duration (Days)": st.column_config.NumberColumn("Duration (Days)", min_value=0.1, step=1.0),
-            "team": st.column_config.SelectboxColumn("Team", options=team_options,
-                                                      help="Assign team for parallel execution")
-        })
-
-with tab_preview:
-    st.write("**Critical Path Calculation**")
-    if not ed_t.empty and "team" in ed_t.columns:
-        team_breakdown = ed_t.groupby("team")["Duration (Days)"].sum().sort_values(ascending=False)
-        for team, duration in team_breakdown.items():
-            capacity = 1.0
-            if not ed_tm.empty:
-                team_row = ed_tm[ed_tm["Team"] == team]
-                if not team_row.empty:
-                    capacity = float(team_row.iloc[0]["Capacity"])
-            effective = duration / capacity
-            col1, col2, col3, col4 = st.columns(4)
-            col1.write(f"**{team}**")
-            col2.metric("Sum", f"{duration:.0f}d")
-            col3.metric("Capacity", f"{capacity}x")
-            col4.metric("Effective", f"{effective:.1f}d")
-
-        try:
-            critical_path_calc = max([
-                float(ed_t[ed_t["team"] == t]["Duration (Days)"].sum()) /
-                (float(ed_tm[ed_tm["Team"] == t]["Capacity"].iloc[0])
-                 if not ed_tm.empty and not ed_tm[ed_tm["Team"] == t].empty else 1.0)
-                for t in ed_t["team"].unique()
-            ])
-        except Exception:
-            critical_path_calc = float(ed_t["Duration (Days)"].sum())
-
-        st.success(f"✅ **Critical Path = {critical_path_calc:.1f} days** "
-                   f"(total sum would be: {ed_t['Duration (Days)'].sum():.0f} days)")
-
-col_t1, col_t2 = st.columns(2)
-with col_t1:
-    if st.button("💾 Save Tasks", use_container_width=True):
-        if "team" not in ed_t.columns:
-            ed_t["team"] = "Sequential"
-        ed_t["team"] = ed_t["team"].fillna("Sequential")
-        save_data(selected_proj, ed_t, load_risks(selected_proj))
-        st.session_state.toast_msg  = "Tasks saved!"
-        st.session_state.toast_type = "success"
-        st.rerun()
-with col_t2:
-    st.info(f"📊 {len(ed_t)} Tasks | CP: {critical_path_calc:.0f}d")
-
-# --- RISKS ---
-st.divider()
-st.subheader("⚠️ 2. Risk Register")
-r_curr = load_risks(selected_proj)
 if "Effect" not in r_curr.columns:
     r_curr["Effect"] = "Threat"
 r_curr["Effect"] = r_curr["Effect"].fillna("Threat")
 
-t_opts = ["Global"] + t_curr["Task Name"].tolist()
-ed_r = st.data_editor(
-    r_curr, use_container_width=True, num_rows="dynamic", key=f"r_{selected_proj}",
-    column_config={
-        "Risk Type": st.column_config.SelectboxColumn("Logic", options=["Binary", "Continuous"], required=True),
-        "Target (Global/Task)": st.column_config.SelectboxColumn("Target", options=t_opts, required=True),
-        "Probability (0-1)": st.column_config.NumberColumn("Probability", min_value=0.0, max_value=1.0, step=0.01),
-        "Effect": st.column_config.SelectboxColumn(
-            "Effect", options=["Threat", "Opportunity"], required=True,
-            help="Threat = delays project | Opportunity = accelerates project"),
-    })
+ed_tm = tm_curr.copy()
+ed_t = t_curr.copy()
+ed_r = r_curr.copy()
+critical_path_calc = 0.0
 
-col_r1, _, col_r3 = st.columns([1, 1, 2])
-with col_r1:
-    if st.button("💾 Save Risks", use_container_width=True):
-        save_data(selected_proj, ed_t, ed_r)
-        st.session_state.toast_msg  = "Risks saved!"
+with tab_team_mgmt:
+    st.subheader("👥 Team Management")
+    st.info("💡 Tasks of the same team run **sequentially**, different teams run **in parallel**.\n"
+            "Capacity > 1.0 = faster (e.g. 2.0 = double speed).")
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.write("**Team Name**")
+        team_names = st.data_editor(
+            tm_curr[["Team"]].reset_index(drop=True),
+            use_container_width=True,
+            num_rows="dynamic",
+            key=f"team_names_{selected_proj}",
+            hide_index=True
+        )
+    with col_b:
+        st.write("**Capacity**")
+        team_caps = st.data_editor(
+            tm_curr[["Capacity"]].reset_index(drop=True),
+            use_container_width=True,
+            num_rows="dynamic",
+            key=f"team_caps_{selected_proj}",
+            hide_index=True,
+            column_config={
+                "Capacity": st.column_config.NumberColumn(
+                    "Capacity", min_value=0.1, max_value=5.0, step=0.1
+                )
+            }
+        )
+    with col_c:
+        st.write("**Examples**")
+        st.markdown("- 0.5 = **2× slower**\n- 1.0 = **Normal**\n- 2.0 = **2× faster**\n- 3.0 = **3× faster**")
+
+    if not team_names.empty and not team_caps.empty:
+        ed_tm = pd.concat([team_names.reset_index(drop=True), team_caps.reset_index(drop=True)], axis=1)
+
+    if st.button("💾 Save Teams", use_container_width=True, key="save_teams"):
+        save_teams(selected_proj, ed_tm)
+        st.session_state.toast_msg = "Teams saved!"
         st.session_state.toast_type = "success"
         st.rerun()
-with col_r3:
-    st.metric("Total Risks", len(ed_r))
+
+with tab_project_structure:
+    st.subheader("📋 1. Project Structure (Tasks)")
+    team_options = ["Sequential"] + ed_tm["Team"].tolist() if not ed_tm.empty else ["Sequential"]
+
+    sub_tab_edit, sub_tab_preview = st.tabs(["Edit", "Critical Path Preview"])
+
+    with sub_tab_edit:
+        ed_t = st.data_editor(
+            t_curr,
+            use_container_width=True,
+            num_rows="dynamic",
+            key=f"t_{selected_proj}",
+            column_config={
+                "Duration (Days)": st.column_config.NumberColumn("Duration (Days)", min_value=0.1, step=1.0),
+                "team": st.column_config.SelectboxColumn(
+                    "Team", options=team_options, help="Assign team for parallel execution"
+                ),
+            }
+        )
+
+    with sub_tab_preview:
+        st.write("**Critical Path Calculation**")
+        if not ed_t.empty and "team" in ed_t.columns:
+            team_breakdown = ed_t.groupby("team")["Duration (Days)"].sum().sort_values(ascending=False)
+            for team, duration in team_breakdown.items():
+                capacity = 1.0
+                if not ed_tm.empty:
+                    team_row = ed_tm[ed_tm["Team"] == team]
+                    if not team_row.empty:
+                        capacity = float(team_row.iloc[0]["Capacity"])
+                effective = duration / capacity
+                c1, c2, c3, c4 = st.columns(4)
+                c1.write(f"**{team}**")
+                c2.metric("Sum", f"{duration:.0f}d")
+                c3.metric("Capacity", f"{capacity}x")
+                c4.metric("Effective", f"{effective:.1f}d")
+
+            try:
+                critical_path_calc = max([
+                    float(ed_t[ed_t["team"] == t]["Duration (Days)"].sum()) /
+                    (float(ed_tm[ed_tm["Team"] == t]["Capacity"].iloc[0])
+                     if not ed_tm.empty and not ed_tm[ed_tm["Team"] == t].empty else 1.0)
+                    for t in ed_t["team"].unique()
+                ])
+            except Exception:
+                critical_path_calc = float(ed_t["Duration (Days)"].sum())
+
+            st.success(
+                f"✅ **Critical Path = {critical_path_calc:.1f} days** "
+                f"(total sum would be: {ed_t['Duration (Days)'].sum():.0f} days)"
+            )
+
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        if st.button("💾 Save Tasks", use_container_width=True):
+            if "team" not in ed_t.columns:
+                ed_t["team"] = "Sequential"
+            ed_t["team"] = ed_t["team"].fillna("Sequential")
+            save_data(selected_proj, ed_t, load_risks(selected_proj))
+            st.session_state.toast_msg = "Tasks saved!"
+            st.session_state.toast_type = "success"
+            st.rerun()
+    with col_t2:
+        st.info(f"📊 {len(ed_t)} Tasks | CP: {critical_path_calc:.0f}d")
+
+with tab_risk_register:
+    st.subheader("⚠️ 2. Risk Register")
+    t_opts = ["Global"] + ed_t["Task Name"].dropna().astype(str).tolist()
+
+    ed_r = st.data_editor(
+        r_curr,
+        use_container_width=True,
+        num_rows="dynamic",
+        key=f"r_{selected_proj}",
+        column_config={
+            "Risk Type": st.column_config.SelectboxColumn("Logic", options=["Binary", "Continuous"], required=True),
+            "Target (Global/Task)": st.column_config.SelectboxColumn("Target", options=t_opts, required=True),
+            "Probability (0-1)": st.column_config.NumberColumn("Probability", min_value=0.0, max_value=1.0, step=0.01),
+            "Effect": st.column_config.SelectboxColumn(
+                "Effect",
+                options=["Threat", "Opportunity"],
+                required=True,
+                help="Threat = delays project | Opportunity = accelerates project",
+            ),
+        },
+    )
+
+    col_r1, _, col_r3 = st.columns([1, 1, 2])
+    with col_r1:
+        if st.button("💾 Save Risks", use_container_width=True):
+            save_data(selected_proj, ed_t, ed_r)
+            st.session_state.toast_msg = "Risks saved!"
+            st.session_state.toast_type = "success"
+            st.rerun()
+    with col_r3:
+        st.metric("Total Risks", len(ed_r))
 
 # --- SIMULATION ---
 st.divider()
