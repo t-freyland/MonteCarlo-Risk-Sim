@@ -999,32 +999,75 @@ Simulationsparameter: {n_sim} Durchläufe | Start: {start_date.strftime('%d.%m.%
             with col_acc3:
                 st.metric("✓ Prognose korrekt", int(correct_predictions))
             
-            # 2. Häufigste eingetretene Risiken
+            # 2. Häufigste eingetretene Risiken (inkl. Threat/Opportunity)
             st.divider()
             st.write("### 🔥 Häufigste eingetretene Risiken")
-            
-            all_risks = []
+
+            # Effect-Lookup aus aktuellem Register + Standardrisiken
+            effect_lookup = {}
+            if not ed_r.empty:
+                for _, rr in ed_r.iterrows():
+                    rn = str(rr.get("Risk Name", "")).strip()
+                    if rn:
+                        effect_lookup[rn] = str(rr.get("Effect", "Threat")).strip() or "Threat"
+            for sr in selected_std:
+                effect_lookup.setdefault(str(sr.get("name", "")).strip(), "Threat")
+
+            risk_rows = []
             for risks_json in actual_df["risks_occurred"]:
-                if risks_json:
-                    try:
-                        all_risks.extend(json.loads(risks_json))
-                    except json.JSONDecodeError:
-                        pass
-            
-            if all_risks:
-                risk_counts = pd.Series(all_risks).value_counts()
+                if not risks_json:
+                    continue
+                try:
+                    items = json.loads(risks_json)
+                    if isinstance(items, list):
+                        for rname in items:
+                            name = str(rname).strip()
+                            if not name:
+                                continue
+                            risk_rows.append({
+                                "Risk": name,
+                                "Effect": effect_lookup.get(name, "Threat")
+                            })
+                except json.JSONDecodeError:
+                    pass
+
+            if risk_rows:
+                risk_df = pd.DataFrame(risk_rows)
+
+                # Kennzahlen
+                threat_hits = int((risk_df["Effect"] != "Opportunity").sum())
+                opp_hits = int((risk_df["Effect"] == "Opportunity").sum())
+                c_rt1, c_rt2 = st.columns(2)
+                c_rt1.metric("⚠️ Threat-Eintritte", threat_hits)
+                c_rt2.metric("🚀 Opportunity-Eintritte", opp_hits)
+
+                # Aggregation pro Risk + Effect
+                risk_counts = (
+                    risk_df.groupby(["Risk", "Effect"])
+                    .size()
+                    .reset_index(name="Count")
+                    .sort_values("Count", ascending=True)
+                )
+
+                colors = risk_counts["Effect"].map({
+                    "Threat": "#EF553B",
+                    "Opportunity": "#2ECC71"
+                }).fillna("#636EFA")
+
                 fig_risk = go.Figure(go.Bar(
-                    x=risk_counts.values, 
-                    y=risk_counts.index, 
+                    x=risk_counts["Count"],
+                    y=risk_counts["Risk"],
                     orientation='h',
-                    marker_color='#EF553B',
-                    text=risk_counts.values,
-                    textposition='auto'
+                    marker_color=colors,
+                    text=risk_counts["Count"],
+                    textposition='auto',
+                    customdata=risk_counts["Effect"],
+                    hovertemplate="<b>%{y}</b><br>Count: %{x}<br>Effect: %{customdata}<extra></extra>"
                 ))
                 fig_risk.update_layout(
                     template="plotly_white",
                     xaxis_title="Häufigkeit",
-                    height=max(300, len(risk_counts)*40),
+                    height=max(300, len(risk_counts) * 40),
                     margin=dict(l=200)
                 )
                 st.plotly_chart(fig_risk, use_container_width=True)
