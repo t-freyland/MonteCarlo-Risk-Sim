@@ -19,7 +19,7 @@ for key in [
     "last_durations", "last_impact_df", "last_commit_85",
     "last_end_dates", "last_top_r", "last_diff",
     "last_warning_msg", "last_rec", "last_history_df",
-    "demo_mode", "std_risk_df",
+    "demo_mode", "std_risk_df", "current_project",
     "toast_msg", "toast_type",
 ]:
     if key not in st.session_state:
@@ -41,6 +41,9 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS teams (
             id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT,
             team_name TEXT, capacity REAL DEFAULT 1.0)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS standard_risks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT,
+            name TEXT, type TEXT, prob REAL, min REAL, likely REAL, max REAL, active BOOLEAN DEFAULT 1)""")
     for sql in [
         "ALTER TABLE risks ADD COLUMN effect TEXT DEFAULT 'Threat'",
         "ALTER TABLE tasks ADD COLUMN team TEXT DEFAULT 'Sequential'",
@@ -126,7 +129,42 @@ def load_risks(project):
     df["Effect"] = df["Effect"].fillna("Threat")
     return df.reset_index(drop=True)
 
-def save_data(project, df_tasks, df_risks):
+def load_standard_risks(project):
+    """Load standard risks for a specific project from database."""
+    conn = get_db_connection()
+    df = pd.read_sql("""
+        SELECT name, type, prob, min, likely, max, active as 'Active'
+        FROM standard_risks WHERE project=? ORDER BY id
+    """, conn, params=(project,))
+    conn.close()
+    if df.empty:
+        return get_default_standard_risks_df()
+    # Ensure correct column names and types
+    df = df.rename(columns={"Active": "Active"})
+    df["Active"] = df["Active"].astype(bool)
+    return df.reset_index(drop=True)
+
+def save_standard_risks(project, df_std_risks):
+    """Save standard risks for a specific project to database."""
+    conn = get_db_connection()
+    conn.execute("DELETE FROM standard_risks WHERE project=?", (project,))
+    for _, row in df_std_risks.iterrows():
+        name = str(row.get("name", "")).strip()
+        if name:
+            try:
+                conn.execute("""
+                    INSERT INTO standard_risks (project, name, type, prob, min, likely, max, active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (project, name, str(row.get("type", "Binary")),
+                      float(row.get("prob", 0)), float(row.get("min", 0)),
+                      float(row.get("likely", 0)), float(row.get("max", 0)),
+                      bool(row.get("Active", True))))
+            except (ValueError, TypeError):
+                pass
+    conn.commit()
+    conn.close()
+
+def save_data(project, df_tasks, df_risks, df_std_risks=None):
     conn = get_db_connection()
     conn.execute("DELETE FROM tasks WHERE project=?", (project,))
     conn.execute("DELETE FROM risks WHERE project=?", (project,))
@@ -164,6 +202,22 @@ def save_data(project, df_tasks, df_risks):
                           str(row.get("Effect", "Threat"))))
             except (ValueError, TypeError):
                 pass
+    # Save standard risks if provided
+    if df_std_risks is not None:
+        conn.execute("DELETE FROM standard_risks WHERE project=?", (project,))
+        for _, row in df_std_risks.iterrows():
+            name = str(row.get("name", "")).strip()
+            if name:
+                try:
+                    conn.execute("""
+                        INSERT INTO standard_risks (project, name, type, prob, min, likely, max, active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (project, name, str(row.get("type", "Binary")),
+                          float(row.get("prob", 0)), float(row.get("min", 0)),
+                          float(row.get("likely", 0)), float(row.get("max", 0)),
+                          bool(row.get("Active", True))))
+                except (ValueError, TypeError):
+                    pass
     conn.commit()
     conn.close()
 
@@ -315,6 +369,8 @@ def import_complete_project(json_str):
                         std_risks_df[col] = 0.0
             std_risks_df = std_risks_df[expected_cols]
             st.session_state.std_risk_df = std_risks_df
+            # Save standard risks to database
+            save_standard_risks(project, std_risks_df)
 
     conn = get_db_connection()
     for row in data.get("history", []):
@@ -530,6 +586,11 @@ with st.sidebar:
         st.session_state.new_project_to_select = None
     
     selected_proj = st.selectbox("Active Project:", all_projs, index=default_index)
+    
+    # Load standard risks for the selected project if it changed
+    if st.session_state.current_project != selected_proj:
+        st.session_state.current_project = selected_proj
+        st.session_state.std_risk_df = load_standard_risks(selected_proj)
 
     st.divider()
     st.subheader("📈 Tracking")
@@ -543,9 +604,10 @@ with st.sidebar:
                 try:
                     source_tasks = load_tasks(selected_proj)
                     source_risks = load_risks(selected_proj)
+                    source_std_risks = load_standard_risks(selected_proj)
                     if source_tasks.empty:
                         source_tasks = pd.DataFrame([{"Task Name": "Task 1", "Duration (Days)": 5.0, "Description": "", "team": "Sequential"}])
-                    save_data(new_p, source_tasks, source_risks)
+                    save_data(new_p, source_tasks, source_risks, source_std_risks)
                     st.session_state.toast_msg  = f"Project '{new_p}' created!"
                     st.session_state.toast_type = "success"
                     st.session_state.new_project_to_select = new_p
@@ -671,7 +733,9 @@ with st.sidebar:
             vals = np.sort(df_tmp[["min", "likely", "max"]].values, axis=1)
             df_tmp["min"], df_tmp["likely"], df_tmp["max"] = vals[:, 0], vals[:, 1], vals[:, 2]
             st.session_state.std_risk_df = df_tmp
-            st.session_state.toast_msg   = "Standard risks updated."
+            # Save standard risks to database for this project
+            save_standard_risks(selected_proj, df_tmp)
+            st.session_state.toast_msg   = "Standard risks updated and saved."
             st.session_state.toast_type  = "success"
             st.rerun()
 
