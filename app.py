@@ -139,8 +139,16 @@ def load_standard_risks(project):
     conn.close()
     if df.empty:
         return get_default_standard_risks_df()
-    # Ensure correct column names and types
-    df = df.rename(columns={"Active": "Active"})
+    expected_cols = ["Active", "name", "type", "prob", "min", "likely", "max"]
+    for col in expected_cols:
+        if col not in df.columns:
+            if col == "Active":
+                df[col] = True
+            elif col == "type":
+                df[col] = "Binary"
+            else:
+                df[col] = 0.0 if col in ("prob", "min", "likely", "max") else ""
+    df = df[expected_cols]
     df["Active"] = df["Active"].astype(bool)
     return df.reset_index(drop=True)
 
