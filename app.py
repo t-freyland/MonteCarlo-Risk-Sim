@@ -522,7 +522,14 @@ with st.sidebar:
         st.warning("🎮 **Demo Mode active**")
 
     all_projs     = get_all_projects()
-    selected_proj = st.selectbox("Active Project:", all_projs)
+    
+    # If a new project was just created, select it automatically
+    default_index = 0
+    if hasattr(st.session_state, 'new_project_to_select') and st.session_state.new_project_to_select in all_projs:
+        default_index = all_projs.index(st.session_state.new_project_to_select)
+        st.session_state.new_project_to_select = None
+    
+    selected_proj = st.selectbox("Active Project:", all_projs, index=default_index)
 
     st.divider()
     st.subheader("📈 Tracking")
@@ -533,10 +540,20 @@ with st.sidebar:
         new_p = st.text_input("New Project / Copy:")
         if st.button("🚀 Create", use_container_width=True):
             if new_p.strip():
-                save_data(new_p, load_tasks(selected_proj), load_risks(selected_proj))
-                st.session_state.toast_msg  = f"Project '{new_p}' created!"
-                st.session_state.toast_type = "success"
-                st.rerun()
+                try:
+                    source_tasks = load_tasks(selected_proj)
+                    source_risks = load_risks(selected_proj)
+                    if source_tasks.empty:
+                        source_tasks = pd.DataFrame([{"Task Name": "Task 1", "Duration (Days)": 5.0, "Description": "", "team": "Sequential"}])
+                    save_data(new_p, source_tasks, source_risks)
+                    st.session_state.toast_msg  = f"Project '{new_p}' created!"
+                    st.session_state.toast_type = "success"
+                    st.session_state.new_project_to_select = new_p
+                    st.rerun()
+                except Exception as e:
+                    st.session_state.toast_msg  = f"Create failed: {str(e)}"
+                    st.session_state.toast_type = "error"
+                    st.rerun()
             else:
                 st.session_state.toast_msg  = "Project name required!"
                 st.session_state.toast_type = "warning"

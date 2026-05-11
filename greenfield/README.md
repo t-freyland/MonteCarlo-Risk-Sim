@@ -7,6 +7,13 @@ Neuer Start ohne Migration aus `app.py`, aber mit den Learnings aus der alten Ap
 - **Single Source of Truth**: Persistenz und Simulation nur im Backend
 - **Testbar**: Domain-Funktionen separat, API separat
 
+## Arbeitsregel
+
+- Die alte App in `MonteCarlo/` bleibt als Produktiv-App bestehen.
+- Dort nur kleine, sichere Bugfixes und rückwärtskompatible Verbesserungen.
+- Größere Architekturänderungen und neue Funktionen nur in `greenfield/`.
+- Keine Migration der alten App auf die neue Architektur.
+
 ## Struktur
 
 - `backend/`: FastAPI Service
