@@ -272,6 +272,7 @@ def export_complete_project(project):
     teams   = load_teams(project)
     history = load_history(project)
     actual  = load_actual_results(project)
+    std_risks = st.session_state.std_risk_df
 
     payload = {
         "export_version": APP_VERSION,
@@ -282,6 +283,7 @@ def export_complete_project(project):
         "teams":          teams.to_dict(orient="records"),
         "history":        history.to_dict(orient="records"),
         "actual_results": actual.to_dict(orient="records"),
+        "standard_risks": std_risks.to_dict(orient="records") if std_risks is not None else [],
     }
     return json.dumps(payload, indent=2, default=str)
 
@@ -296,6 +298,23 @@ def import_complete_project(json_str):
                   pd.DataFrame(data.get("risks", [])))
     if data.get("teams"):
         save_teams(project, pd.DataFrame(data["teams"]))
+
+    if data.get("standard_risks") is not None:
+        std_risks_df = pd.DataFrame(data.get("standard_risks", []))
+        if not std_risks_df.empty:
+            expected_cols = ["Active", "name", "type", "prob", "min", "likely", "max"]
+            for col in expected_cols:
+                if col not in std_risks_df.columns:
+                    if col == "Active":
+                        std_risks_df[col] = True
+                    elif col == "type":
+                        std_risks_df[col] = "Binary"
+                    elif col == "prob":
+                        std_risks_df[col] = 0.0
+                    else:
+                        std_risks_df[col] = 0.0
+            std_risks_df = std_risks_df[expected_cols]
+            st.session_state.std_risk_df = std_risks_df
 
     conn = get_db_connection()
     for row in data.get("history", []):
